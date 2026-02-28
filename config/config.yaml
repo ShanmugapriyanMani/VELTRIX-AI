@@ -1,0 +1,299 @@
+# ═══════════════════════════════════════════
+# MAIN CONFIGURATION — Indian AI Trading Bot
+# ═══════════════════════════════════════════
+
+upstox:
+  # ─── Credentials (set via env vars) ───
+  api_key: ""       # Set via UPSTOX_LIVE_API_KEY env var
+  api_secret: ""    # Set via UPSTOX_LIVE_API_SECRET env var
+  redirect_uri: "http://127.0.0.1:5000/callback"
+  api_base_url: "https://api.upstox.com"
+  api_hft_url: "https://api-hft.upstox.com"
+
+  # Token & API settings
+  access_token_path: "config/.access_token"
+  api_version: "v3"
+
+database:
+  engine: "sqlite"  # "sqlite" for dev, "timescaledb" for prod
+  sqlite_path: "data/trading_bot.db"
+  timescaledb:
+    host: "localhost"
+    port: 5432
+    database: "trading_bot"
+    user: "trader"
+    password: "YOUR_DB_PASSWORD"
+
+trading:
+  capital: 50000
+  per_strategy:
+    fii_flow: 0.30
+    options_oi: 0.25
+    delivery_vol: 0.25
+    ml_pred: 0.20
+  market_hours:
+    open: "09:15"
+    close: "15:30"
+    skip_first_minutes: 15
+    square_off_time: "15:15"
+  timezone: "Asia/Kolkata"
+
+# ─────────────────────────────────────────
+# NIFTY 50 Universe — Upstox instrument format
+# Format: "NSE_EQ|{ISIN}"
+# Updated: Feb 2026 — verify quarterly
+# ─────────────────────────────────────────
+universe:
+  nifty50:
+    RELIANCE:
+      isin: "INE002A01018"
+      instrument_key: "NSE_EQ|INE002A01018"
+      sector: "OIL_GAS"
+    TCS:
+      isin: "INE467B01029"
+      instrument_key: "NSE_EQ|INE467B01029"
+      sector: "IT"
+    HDFCBANK:
+      isin: "INE040A01034"
+      instrument_key: "NSE_EQ|INE040A01034"
+      sector: "BANKING"
+    INFY:
+      isin: "INE009A01021"
+      instrument_key: "NSE_EQ|INE009A01021"
+      sector: "IT"
+    ICICIBANK:
+      isin: "INE090A01021"
+      instrument_key: "NSE_EQ|INE090A01021"
+      sector: "BANKING"
+    HINDUNILVR:
+      isin: "INE030A01027"
+      instrument_key: "NSE_EQ|INE030A01027"
+      sector: "FMCG"
+    ITC:
+      isin: "INE154A01025"
+      instrument_key: "NSE_EQ|INE154A01025"
+      sector: "FMCG"
+    SBIN:
+      isin: "INE062A01020"
+      instrument_key: "NSE_EQ|INE062A01020"
+      sector: "BANKING"
+    BHARTIARTL:
+      isin: "INE397D01024"
+      instrument_key: "NSE_EQ|INE397D01024"
+      sector: "TELECOM"
+    KOTAKBANK:
+      isin: "INE237A01036"
+      instrument_key: "NSE_EQ|INE237A01036"
+      sector: "BANKING"
+    LT:
+      isin: "INE018A01030"
+      instrument_key: "NSE_EQ|INE018A01030"
+      sector: "INFRASTRUCTURE"
+    AXISBANK:
+      isin: "INE238A01034"
+      instrument_key: "NSE_EQ|INE238A01034"
+      sector: "BANKING"
+    ASIANPAINT:
+      isin: "INE021A01026"
+      instrument_key: "NSE_EQ|INE021A01026"
+      sector: "CONSUMER"
+    MARUTI:
+      isin: "INE585B01010"
+      instrument_key: "NSE_EQ|INE585B01010"
+      sector: "AUTO"
+    HCLTECH:
+      isin: "INE860A01027"
+      instrument_key: "NSE_EQ|INE860A01027"
+      sector: "IT"
+    SUNPHARMA:
+      isin: "INE044A01036"
+      instrument_key: "NSE_EQ|INE044A01036"
+      sector: "PHARMA"
+    TATAMOTORS:
+      isin: "INE155A01022"
+      instrument_key: "NSE_EQ|INE155A01022"
+      sector: "AUTO"
+    WIPRO:
+      isin: "INE075A01022"
+      instrument_key: "NSE_EQ|INE075A01022"
+      sector: "IT"
+    BAJFINANCE:
+      isin: "INE296A01032"
+      instrument_key: "NSE_EQ|INE296A01032"
+      sector: "NBFC"
+    ULTRACEMCO:
+      isin: "INE481G01011"
+      instrument_key: "NSE_EQ|INE481G01011"
+      sector: "CEMENT"
+    TITAN:
+      isin: "INE280A01028"
+      instrument_key: "NSE_EQ|INE280A01028"
+      sector: "CONSUMER"
+    NESTLEIND:
+      isin: "INE239A01024"
+      instrument_key: "NSE_EQ|INE239A01024"
+      sector: "FMCG"
+    TECHM:
+      isin: "INE669C01036"
+      instrument_key: "NSE_EQ|INE669C01036"
+      sector: "IT"
+    NTPC:
+      isin: "INE733E01010"
+      instrument_key: "NSE_EQ|INE733E01010"
+      sector: "POWER"
+    POWERGRID:
+      isin: "INE752E01010"
+      instrument_key: "NSE_EQ|INE752E01010"
+      sector: "POWER"
+    TATASTEEL:
+      isin: "INE081A01020"
+      instrument_key: "NSE_EQ|INE081A01020"
+      sector: "METALS"
+    ONGC:
+      isin: "INE213A01029"
+      instrument_key: "NSE_EQ|INE213A01029"
+      sector: "OIL_GAS"
+    M_M:
+      isin: "INE101A01026"
+      instrument_key: "NSE_EQ|INE101A01026"
+      sector: "AUTO"
+    JSWSTEEL:
+      isin: "INE019A01038"
+      instrument_key: "NSE_EQ|INE019A01038"
+      sector: "METALS"
+    ADANIENT:
+      isin: "INE423A01024"
+      instrument_key: "NSE_EQ|INE423A01024"
+      sector: "CONGLOMERATE"
+    ADANIPORTS:
+      isin: "INE742F01042"
+      instrument_key: "NSE_EQ|INE742F01042"
+      sector: "INFRASTRUCTURE"
+    BAJAJFINSV:
+      isin: "INE918I01026"
+      instrument_key: "NSE_EQ|INE918I01026"
+      sector: "NBFC"
+    COALINDIA:
+      isin: "INE522F01014"
+      instrument_key: "NSE_EQ|INE522F01014"
+      sector: "MINING"
+    GRASIM:
+      isin: "INE047A01021"
+      instrument_key: "NSE_EQ|INE047A01021"
+      sector: "CEMENT"
+    DIVISLAB:
+      isin: "INE361B01024"
+      instrument_key: "NSE_EQ|INE361B01024"
+      sector: "PHARMA"
+    CIPLA:
+      isin: "INE059A01026"
+      instrument_key: "NSE_EQ|INE059A01026"
+      sector: "PHARMA"
+    DRREDDY:
+      isin: "INE089A01031"
+      instrument_key: "NSE_EQ|INE089A01031"
+      sector: "PHARMA"
+    EICHERMOT:
+      isin: "INE066A01021"
+      instrument_key: "NSE_EQ|INE066A01021"
+      sector: "AUTO"
+    HEROMOTOCO:
+      isin: "INE158A01026"
+      instrument_key: "NSE_EQ|INE158A01026"
+      sector: "AUTO"
+    BRITANNIA:
+      isin: "INE216A01030"
+      instrument_key: "NSE_EQ|INE216A01030"
+      sector: "FMCG"
+    APOLLOHOSP:
+      isin: "INE437A01024"
+      instrument_key: "NSE_EQ|INE437A01024"
+      sector: "HEALTHCARE"
+    INDUSINDBK:
+      isin: "INE095A01012"
+      instrument_key: "NSE_EQ|INE095A01012"
+      sector: "BANKING"
+    SBILIFE:
+      isin: "INE123W01016"
+      instrument_key: "NSE_EQ|INE123W01016"
+      sector: "INSURANCE"
+    HDFCLIFE:
+      isin: "INE795G01014"
+      instrument_key: "NSE_EQ|INE795G01014"
+      sector: "INSURANCE"
+    TATACONSUM:
+      isin: "INE192A01025"
+      instrument_key: "NSE_EQ|INE192A01025"
+      sector: "FMCG"
+    BAJAJ_AUTO:
+      isin: "INE917I01010"
+      instrument_key: "NSE_EQ|INE917I01010"
+      sector: "AUTO"
+    BPCL:
+      isin: "INE029A01011"
+      instrument_key: "NSE_EQ|INE029A01011"
+      sector: "OIL_GAS"
+    HINDALCO:
+      isin: "INE038A01020"
+      instrument_key: "NSE_EQ|INE038A01020"
+      sector: "METALS"
+    UPL:
+      isin: "INE628A01036"
+      instrument_key: "NSE_EQ|INE628A01036"
+      sector: "CHEMICALS"
+
+  # F&O Options Universe
+  options:
+    NIFTY:
+      lot_size: 65
+      strike_gap: 50
+      index_key: "NSE_INDEX|Nifty 50"
+    BANKNIFTY:
+      lot_size: 30
+      strike_gap: 100
+      index_key: "NSE_INDEX|Nifty Bank"
+
+  # Indices for reference
+  indices:
+    NIFTY50:
+      instrument_key: "NSE_INDEX|Nifty 50"
+    BANKNIFTY:
+      instrument_key: "NSE_INDEX|Nifty Bank"
+    INDIA_VIX:
+      instrument_key: "NSE_INDEX|India VIX"
+    NIFTY_NEXT50:
+      instrument_key: "NSE_INDEX|Nifty Next 50"
+
+  sectors:
+    BANKING: ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "INDUSINDBK"]
+    IT: ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM"]
+    PHARMA: ["SUNPHARMA", "DIVISLAB", "CIPLA", "DRREDDY"]
+    AUTO: ["MARUTI", "TATAMOTORS", "M_M", "EICHERMOT", "HEROMOTOCO", "BAJAJ_AUTO"]
+    FMCG: ["HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "TATACONSUM"]
+    OIL_GAS: ["RELIANCE", "ONGC", "BPCL"]
+    METALS: ["TATASTEEL", "JSWSTEEL", "HINDALCO"]
+    NBFC: ["BAJFINANCE", "BAJAJFINSV"]
+    POWER: ["NTPC", "POWERGRID"]
+    INFRASTRUCTURE: ["LT", "ADANIPORTS"]
+
+logging:
+  level: "INFO"
+  format: "json"
+  log_dir: "logs"
+  rotation: "10 MB"
+  retention: "30 days"
+
+alerts:
+  telegram:
+    enabled: true
+    bot_token: ""   # Set via TELEGRAM_BOT_TOKEN env var
+    chat_id: ""     # Set via TELEGRAM_CHAT_ID env var
+    send_periodic_updates: true
+    update_interval: 30
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender: "your_email@gmail.com"
+    password: "YOUR_EMAIL_APP_PASSWORD"
+    receiver: "your_email@gmail.com"

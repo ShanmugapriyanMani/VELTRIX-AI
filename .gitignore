@@ -1,0 +1,42 @@
+# Secrets
+.env
+config/.access_token
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & Logs (local only)
+data/
+logs/
+models/
+
+# ML model artifacts
+catboost_info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Docs (local only)
+*.docx

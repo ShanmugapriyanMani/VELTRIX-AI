@@ -1,0 +1,129 @@
+# ═══════════════════════════════════════════
+# RISK MANAGEMENT — VELTRIX V4 / ₹25K capital
+# ═══════════════════════════════════════════
+# ₹25K deploy cap, ₹10K max risk per trade.
+# Dynamic lots (1-7), min confidence 0.70 filters out noise.
+
+# ─────────────────────────────────────────
+# Position Sizing
+# ─────────────────────────────────────────
+position_sizing:
+  method: "kelly"
+  kelly_fraction: 0.7                  # 0.7 Kelly
+  max_per_trade_pct: 40.0              # 40% per trade = ₹20,000 positions
+  max_per_stock_pct: 50.0              # 50% per stock = ₹25,000
+  max_per_sector_pct: 80.0             # 80% per sector
+  max_total_exposure_pct: 90.0         # 90% max deployed
+  min_position_value: 5000             # Min ₹5,000 (below this, brokerage eats profits)
+  max_position_value: 50000            # Max ₹50,000 per position (2 lots)
+  min_cash_reserve_pct: 10.0           # 10% cash buffer
+  confidence_scaling: true
+  atr_scaling: true
+  atr_period: 14
+  lot_rounding: true
+
+# ─────────────────────────────────────────
+# Stop Loss & Take Profit
+# ─────────────────────────────────────────
+stops:
+  stop_loss_atr_multiplier: 1.5        # 1.5x ATR — not too tight
+  take_profit_atr_multiplier: 2.0      # 2x ATR — reachable target
+  trailing_stop: true
+  trailing_stop_atr_multiplier: 1.0    # Trail at 1x ATR once in profit
+  trailing_activation_pct: 0.8         # Activate trailing after 0.8% profit
+  time_stop_days: 4                    # Exit after 4 days max
+  max_slippage_pct: 0.5
+  use_gtt_orders: true
+
+# ─────────────────────────────────────────
+# Circuit Breakers
+# ─────────────────────────────────────────
+circuit_breakers:
+  daily_loss:
+    warning_amount: 5000               # ₹5K daily loss → conviction +1.0
+    halt_amount: 10000                 # ₹10K daily loss → halt
+    action: "halt_day"
+    alert: true
+  drawdown:
+    warning_pct: 15.0                  # 15% drawdown → conviction +1.0
+    critical_pct: 20.0                 # 20% drawdown → HALT (₹10,000 from peak)
+    warning_action: "conviction_boost"
+    critical_action: "halt_and_alert"
+  consecutive_losses:
+    pause_threshold: 4                 # 4 consecutive losses → pause 1 hour
+    halt_threshold: 7                  # 7 consecutive losses → halt day
+    pause_duration_minutes: 60
+  max_daily_trades: 2                  # TRENDING max 2, RANGEBOUND/VOLATILE max 1
+  max_daily_orders: 20
+  max_orders_per_minute: 10
+  max_open_positions: 2                # Only 2 positions at a time
+  weekly_loss:
+    warning_pct: 8.0                   # 8% weekly loss → skip next day
+    action: "skip_next_day"
+  monthly_loss:
+    warning_pct: 12.0                  # 12% monthly loss → pause 3 days
+    pause_days: 3
+    action: "pause_days"
+  kill_switch:
+    enabled: true
+    action: "cancel_all_flatten"
+    alert: true
+
+# ─────────────────────────────────────────
+# Ensemble Signal Filter
+# ─────────────────────────────────────────
+ensemble:
+  min_confidence: 0.70                 # KEY: Only trade high conviction signals
+
+# ─────────────────────────────────────────
+# Portfolio Risk Limits
+# ─────────────────────────────────────────
+portfolio:
+  max_correlation: 0.7
+  correlation_lookback: 60
+  var_confidence: 0.95
+  var_method: "historical"
+  max_var_pct: 5.0
+  beta_target: 1.0
+  beta_tolerance: 0.3
+  rebalance_threshold_pct: 5.0
+
+# ─────────────────────────────────────────
+# Upstox Brokerage Costs
+# ─────────────────────────────────────────
+brokerage:
+  equity_delivery:
+    per_order: 20
+    pct: 0.025
+  equity_intraday:
+    per_order: 20
+    pct: 0.001
+  fo_futures:
+    per_order: 20
+    pct: 0.0005
+  fo_options:
+    per_order: 20
+  stt:
+    delivery_both_sides: 0.001
+    intraday_sell: 0.00025
+  gst_pct: 0.18
+  sebi_charges_per_crore: 10
+  stamp_duty:
+    delivery_buy: 0.00015
+    intraday_buy: 0.00003
+  nse_txn_charges: 0.0000297
+  dp_charges_per_scrip: 18.5
+
+# ─────────────────────────────────────────
+# Options-Specific Risk Parameters
+# ─────────────────────────────────────────
+options_risk:
+  max_deployable_per_trade: 25000   # ₹25K FIXED deploy cap (never changes)
+  max_risk_per_trade: 10000         # ₹10K max loss per FULL trade
+  premium_stop_loss_pct: 30         # Exit if premium drops 30% (base, VIX-adaptive)
+  premium_take_profit_pct: 45       # Exit if premium rises 45% (base, VIX-adaptive)
+  max_daily_options_loss: 10000     # ₹10K daily loss → halt
+  force_exit_time: "15:10"          # Mandatory intraday exit
+  min_premium: 80                   # Min ₹80 premium (universal floor)
+  min_wallet_balance: 50000         # Live mode: min ₹50K wallet to trade
+  buffer: 5000                      # ₹5K emergency reserve (never touched)

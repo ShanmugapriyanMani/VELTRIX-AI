@@ -1,0 +1,195 @@
+# ═══════════════════════════════════════════
+# STRATEGY CONFIGURATION — VELTRIX V4
+# ═══════════════════════════════════════════
+
+# ─────────────────────────────────────────
+# LAYER 1: Regime Detection Parameters
+# ─────────────────────────────────────────
+regime:
+  # 3-regime system: TRENDING, RANGEBOUND, VOLATILE
+  # Direction (bull/bear) comes from scoring, NOT regime
+  vix:
+    low_threshold: 13.0      # VIX < 13 → low vol environment
+    high_threshold: 22.0     # VIX > 22 → VOLATILE regime trigger
+    extreme_threshold: 30.0  # VIX > 30 → VOLATILE (immediate, high confidence)
+  adx:
+    period: 14
+    trending_threshold: 25   # ADX > 25 → TRENDING regime
+    sideways_threshold: 20   # ADX < 20 → RANGEBOUND regime
+  regime_change_cooldown_minutes: 60  # Min time between regime switches
+
+# ─────────────────────────────────────────
+# LAYER 2: Strategy Parameters
+# ─────────────────────────────────────────
+
+# Strategy 1: FII Flow Momentum
+# DISABLED: Upstox doesn't provide FII data — always returns zero
+fii_flow:
+  enabled: false
+  fii_buy_threshold_cr: 1000     # FII buy > ₹1000cr for consecutive days
+  fii_sell_threshold_cr: -1000   # FII sell > ₹1000cr for consecutive days
+  consecutive_days: 3            # Min consecutive days of directional flow
+  hold_days: 5                   # Holding period
+  max_stocks: 5                  # Max stocks to hold at once
+  sector_rotation: true          # Track FII sector preferences
+  sector_concentration_threshold: 0.4  # FII putting > 40% in one sector = concentrated
+  min_fii_holding_pct: 15.0      # Only stocks with FII holding > 15%
+  active_regimes:                # Only active in these regimes
+    - "TRENDING"
+    - "RANGEBOUND"
+  signal_decay_days: 7           # Signal weakens after this many days
+  weight: 1.0                    # Base weight in ensemble
+
+# Strategy 2: Options OI Intelligence
+options_oi:
+  enabled: true
+  pcr_bullish: 1.3               # PCR > 1.3 → Bullish sentiment
+  pcr_bearish: 0.7               # PCR < 0.7 → Bearish sentiment
+  oi_change_threshold_pct: 10    # Significant OI change %
+  breakout_oi_decline_pct: 15    # OI declining > 15% at resistance = breakout signal
+  max_pain_distance_pct: 2.0     # Max pain within 2% of price → pinning likely
+  expiry_day_special: true       # Special logic on Thursday (expiry)
+  expiry_oi_unwind_threshold: 20 # OI unwinding > 20% on expiry day
+  instruments:                   # Track options for these
+    - "NIFTY"
+    - "BANKNIFTY"
+  strike_range: 10               # Analyze ±10 strikes from ATM
+  active_regimes:
+    - "TRENDING"
+    - "RANGEBOUND"
+    - "VOLATILE"
+  weight: 1.0
+
+# Strategy 3: Delivery Volume Divergence
+# DISABLED: Upstox doesn't provide delivery volume data
+delivery_volume:
+  enabled: false
+  accumulation_threshold_pct: 60.0   # Delivery % > 60% → institutional activity
+  distribution_threshold_pct: 30.0   # Delivery % < 30% → speculative/weak hands
+  price_change_threshold_pct: -1.0   # Price drop > 1% for accumulation signal
+  price_rise_threshold_pct: 1.0      # Price rise > 1% for distribution signal
+  min_volume_cr: 50                  # Min traded value ₹50cr
+  hold_days_min: 3
+  hold_days_max: 5
+  universe: "NIFTY50"               # Only NIFTY 50 stocks
+  volume_ma_period: 20              # 20-day avg volume for comparison
+  delivery_ma_period: 20            # 20-day avg delivery % baseline
+  delivery_spike_multiplier: 1.5    # Delivery % > 1.5x avg = significant
+  active_regimes:
+    - "TRENDING"
+    - "RANGEBOUND"
+  weight: 1.0
+
+# Strategy 4: ML Predictor
+ml_predictor:
+  enabled: true
+  model_type: "lightgbm"
+  model_path: "models/lgbm_latest.pkl"
+  scaler_path: "models/scaler_latest.pkl"
+  features:
+    # Technical (11)
+    - "rsi_14"
+    - "macd_histogram"
+    - "bb_position"
+    - "atr_pct"
+    - "adx_14"
+    - "volume_ratio"
+    - "volatility_20d"
+    - "returns_1d"
+    - "returns_5d"
+    - "price_to_sma50"
+    - "mfi_14"
+    # FII/DII (7)
+    - "fii_net_flow_1d"
+    - "fii_net_flow_5d"
+    - "fii_flow_momentum"
+    - "fii_net_direction"
+    - "fii_net_streak"
+    - "dii_net_flow_1d"
+    - "india_vix"
+    # VIX extended (3)
+    - "vix_change_pct"
+    - "vix_percentile_252d"
+    - "vix_5d_ma"
+    # External markets (9)
+    - "sp500_prev_return"
+    - "nasdaq_prev_return"
+    - "crude_prev_return"
+    - "gold_prev_return"
+    - "usdinr_prev_return"
+    - "sp500_nifty_corr_20d"
+    - "crude_nifty_corr_20d"
+    - "dxy_momentum_5d"
+    - "global_risk_score"
+    # Options (4)
+    - "pcr_ratio"
+    - "max_pain_distance"
+    - "delivery_pct"
+    - "futures_premium_pct"
+  max_features: 37
+  confidence_threshold: 0.62     # Only signal if predict_proba > 0.62
+  label:
+    up_threshold: 0.005          # +0.5% → class 1
+    down_threshold: -0.005       # -0.5% → class -1
+  training:
+    train_window: 252            # 1 year training window
+    test_window: 5               # 5-day test window
+    retrain_day: "Saturday"
+    retrain_hour: 10
+    n_splits: 5                  # TimeSeriesSplit folds
+    early_stopping_rounds: 50
+    min_trades_significance: 200 # Min trades for statistical significance
+  lightgbm_params:
+    objective: "multiclass"
+    num_class: 3
+    metric: "multi_logloss"
+    learning_rate: 0.05
+    num_leaves: 31
+    max_depth: 6
+    min_child_samples: 20
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    n_estimators: 500
+    verbose: -1
+  active_regimes:
+    - "TRENDING"
+    - "RANGEBOUND"
+  weight: 1.0
+
+# Strategy 5: Options Buyer (Directional NIFTY/BANKNIFTY options buying)
+options_buyer:
+  enabled: true
+  instruments:
+    - "NIFTY"
+  strike_offset: 1                  # 1 strike OTM from ATM
+  expiry: "weekly"                  # Current week expiry
+  premium_sl_pct: 30                # 30% premium loss → exit (overridden by VIX-adaptive)
+  premium_tp_pct: 45                # 45% premium gain → exit (overridden by VIX-adaptive)
+  max_deployable: 25000              # ₹25K FIXED deploy cap (never changes)
+  max_risk_per_trade: 10000         # ₹10,000 max loss per FULL trade
+  force_exit_time: "15:10"          # Mandatory intraday exit
+  min_confidence: 0.65
+  pcr_bullish: 1.3                  # PCR > 1.3 → BUY CE
+  pcr_bearish: 0.7                  # PCR < 0.7 → BUY PE
+  active_regimes:
+    - "TRENDING"
+    - "RANGEBOUND"
+    - "VOLATILE"
+  weight: 1.5                       # Higher weight — primary strategy
+
+# ─────────────────────────────────────────
+# LAYER 3: Ensemble Configuration
+# ─────────────────────────────────────────
+ensemble:
+  method: "sharpe_weighted"          # Weight strategies by rolling Sharpe
+  sharpe_lookback_days: 63           # ~3 months rolling Sharpe
+  min_sharpe_weight: 0.05            # Minimum weight for any active strategy
+  max_sharpe_weight: 0.50            # Maximum weight cap
+  buy_threshold: 0.45                # Ensemble score > 0.45 → BUY (was 0.5)
+  sell_threshold: -0.45              # Ensemble score < -0.45 → SELL (was -0.5)
+  disagreement_size_reduction: 0.5   # 50% size when strategies disagree (2 buy, 2 sell)
+  regime_override: true              # Regime filter overrides weights
+  min_active_strategies: 1           # Options Buyer has its own multi-factor confidence check
+  signal_expiry_minutes: 30          # Signal valid for 30 minutes

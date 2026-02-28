@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════════
+# Indian AI Trading Bot — Dependencies
+# ═══════════════════════════════════════════
+
+# Core
+numpy>=1.24.0
+pandas>=2.0.0
+pyyaml>=6.0
+loguru>=0.7.0
+requests>=2.31.0
+
+# Upstox Broker SDK
+upstox-python-sdk>=2.19.0
+
+# Machine Learning
+lightgbm>=4.1.0
+scikit-learn>=1.3.0
+
+# External Data Sources
+yfinance>=1.2.0
+nsepython>=0.6.0
+
+# Technical Analysis (optional, we compute our own)
+# ta-lib  # Requires C library
+
+# Optimization
+optuna>=3.4.0
+
+# Dashboard
+streamlit>=1.28.0
+plotly>=5.18.0
+
+# Telegram Alerts
+python-telegram-bot>=20.6
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Async Support
+aiohttp>=3.9.0
+
+# Deployment
+docker>=6.1.0
+
+# Type checking (dev)
+mypy>=1.7.0
