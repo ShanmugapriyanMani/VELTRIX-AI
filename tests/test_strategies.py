@@ -20,7 +20,7 @@ class TestFIIFlowStrategy:
 
     def test_no_signal_when_insufficient_consecutive_days(self):
         data = {
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "fii_consecutive": {"direction": "buy", "consecutive_days": 1, "total_flow_cr": 500},
             "stock_universe": {},
         }
@@ -29,7 +29,7 @@ class TestFIIFlowStrategy:
 
     def test_buy_signal_on_consecutive_fii_buying(self):
         data = {
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "fii_consecutive": {"direction": "buy", "consecutive_days": 4, "total_flow_cr": 5000},
             "stock_universe": {
                 "RELIANCE": {
@@ -48,7 +48,7 @@ class TestFIIFlowStrategy:
 
     def test_sell_signal_on_fii_selling(self):
         data = {
-            "regime": "BEAR_TRENDING",
+            "regime": "TRENDING",
             "fii_consecutive": {"direction": "sell", "consecutive_days": 4, "total_flow_cr": -5000},
             "stock_universe": {"RELIANCE": {"price": 2500}},
         }
@@ -58,7 +58,7 @@ class TestFIIFlowStrategy:
 
     def test_inactive_in_wrong_regime(self):
         data = {
-            "regime": "HIGH_VOLATILITY",
+            "regime": "VOLATILE",
             "fii_consecutive": {"direction": "buy", "consecutive_days": 5, "total_flow_cr": 8000},
             "stock_universe": {"RELIANCE": {"price": 2500}},
         }
@@ -72,7 +72,7 @@ class TestOptionsOIStrategy:
 
     def test_pcr_bullish_signal(self):
         data = {
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "oi_levels": {
                 "max_call_oi_strike": 22500,
                 "max_call_oi": 1000000,
@@ -95,7 +95,7 @@ class TestOptionsOIStrategy:
 
     def test_no_signal_in_wrong_regime(self):
         data = {
-            "regime": "HIGH_VOLATILITY",
+            "regime": "INVALID_REGIME",
             "oi_levels": {},
             "pcr": {},
             "max_pain": {},
@@ -111,7 +111,7 @@ class TestDeliveryVolumeStrategy:
 
     def test_accumulation_signal(self):
         data = {
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "delivery_divergences": {
                 "accumulation": [
                     {
@@ -140,7 +140,7 @@ class TestDeliveryVolumeStrategy:
 
     def test_distribution_signal(self):
         data = {
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "delivery_divergences": {
                 "accumulation": [],
                 "distribution": [
@@ -193,8 +193,8 @@ class TestRegimeDetector:
         fii_data = pd.DataFrame({"fii_net_value": [100, 200, -50, 300, 150]})
 
         state = self.detector.detect(vix_data, nifty_df, fii_data)
-        assert state.regime == MarketRegime.HIGH_VOLATILITY
-        assert state.size_multiplier == 0.0
+        assert state.regime == MarketRegime.VOLATILE
+        assert state.size_multiplier == 0.5
 
     def test_bull_trending(self):
         vix_data = {"vix": 14, "change_pct": -1}
@@ -202,12 +202,13 @@ class TestRegimeDetector:
         fii_data = pd.DataFrame({"fii_net_value": [500, 800, 600, 700, 900]})
 
         state = self.detector.detect(vix_data, nifty_df, fii_data)
-        assert "fii_flow" in state.active_strategies
+        # TRENDING regime active strategies: options_oi, ml_predictor, options_buyer
+        assert "options_oi" in state.active_strategies
 
-    def test_active_strategies_for_sideways(self):
-        active = self.detector.get_active_strategies(MarketRegime.SIDEWAYS_LOW_VOL)
+    def test_active_strategies_for_rangebound(self):
+        active = self.detector.get_active_strategies(MarketRegime.RANGEBOUND)
         assert "options_oi" in active
-        assert "delivery_volume" in active
+        assert "ml_predictor" in active
 
 
 class TestEnsemble:

@@ -21,9 +21,9 @@ from urllib.parse import urlparse, parse_qs
 _root = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _root)
 
-# Load .env
-from src.main import _load_dotenv
-_load_dotenv(os.path.join(_root, ".env"))
+# Load .env + .env.{stage} via env_loader (auto-loads on import)
+from src.config.env_loader import get_config
+get_config()  # Trigger env loading
 
 import yaml
 from src.data.fetcher import build_auth_from_config

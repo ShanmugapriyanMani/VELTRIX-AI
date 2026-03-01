@@ -17,7 +17,6 @@ CLI: python src/main.py --mode live|paper|backtest|fetch
 from __future__ import annotations
 
 import argparse
-import os
 import pickle
 import signal as sig
 import sys
@@ -35,29 +34,16 @@ import pandas as pd
 import yaml
 from loguru import logger
 
+from src.config.env_loader import get_config
 
-def _load_dotenv(env_path: str = ".env") -> None:
-    """Load .env file into os.environ (no external dependency needed)."""
-    path = Path(env_path)
-    if not path.exists():
-        return
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:  # Don't override existing env vars
-                os.environ[key] = value
+_cfg = get_config()
 
 # Configure loguru
 logger.remove()
 logger.add(
     sys.stderr,
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-    level="INFO",
+    level=_cfg.LOG_LEVEL,
 )
 logger.add(
     "logs/bot_{time:YYYY-MM-DD}.log",
@@ -109,10 +95,12 @@ class TradingBot:
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
-        capital = self.config["trading"]["capital"]
+        cfg = get_config()
+        capital = cfg.TRADING_CAPITAL
 
         # ── Initialize components ──
         logger.info(f"Initializing Trading Bot (mode={mode}, capital=₹{capital:,.0f})")
+        cfg.log_config()
 
         self.store = DataStore(config_path)
         self.data_fetcher = UpstoxDataFetcher(config_path, store=self.store)
@@ -190,6 +178,13 @@ class TradingBot:
             return
         logger.info(f"Starting Trading Bot in {self.mode} mode")
 
+        # ── Market schedule check ──
+        if not self._skip_wait:
+            schedule = self._check_market_schedule()
+            if schedule in ("closed_day", "closed_time"):
+                return
+            # "wait" and "trade" both proceed — existing _wait_until() calls handle timing
+
         try:
             # ── Phase 0: Auto-fetch all data (incremental — fast when up to date) ──
             logger.info("=== AUTO-FETCH: Updating all data sources ===")
@@ -198,6 +193,13 @@ class TradingBot:
 
             # ── Phase 0b: Train options direction ML model ──
             self._train_options_direction_ml()
+
+            # ── Setup complete: show waiting message if before trading window ──
+            cfg = get_config()
+            _ts_h, _ts_m = (int(x) for x in cfg.TRADE_START.split(":"))
+            if not self._skip_wait and datetime.now().time() < dt_time(_ts_h, _ts_m):
+                logger.info("Setup complete. Waiting for trading window...")
+                logger.info(f"Market opens {cfg.MARKET_OPEN} | Trading starts {cfg.TRADE_START}")
 
             # ── Send bot started alert ──
             self.alerts.alert_bot_started(
@@ -317,7 +319,7 @@ class TradingBot:
         logger.info("Pre-market data collection complete")
 
     def _connect_broker(self) -> None:
-        """Connect to broker."""
+        """Connect to broker and verify account capital for live mode."""
         logger.info("=== BROKER CONNECTION ===")
 
         if not self.broker.connect():
@@ -327,13 +329,43 @@ class TradingBot:
                 return
             logger.warning("Broker connection failed (paper mode continues)")
 
+        # ── Capital verification (live mode only) ──
+        if self.mode == "live" and self._running:
+            cfg = get_config()
+            try:
+                funds = self.broker.get_funds()
+                available = float(funds.get("available_margin", 0))
+                used = float(funds.get("used_margin", 0))
+                total = available + used
+
+                logger.info(f"Account funds: Available ₹{available:,.2f} | Used ₹{used:,.2f} | Total ₹{total:,.2f}")
+                logger.info(f"Config requires: Capital ₹{cfg.TRADING_CAPITAL:,.0f} | Deploy Cap ₹{cfg.DEPLOY_CAP:,.0f} | Min Wallet ₹{cfg.MIN_WALLET_BALANCE:,.0f}")
+
+                if available < cfg.MIN_WALLET_BALANCE:
+                    logger.critical(
+                        f"INSUFFICIENT FUNDS: ₹{available:,.2f} available < "
+                        f"₹{cfg.MIN_WALLET_BALANCE:,.0f} minimum. Aborting."
+                    )
+                    self._running = False
+                    return
+
+                if available < cfg.DEPLOY_CAP:
+                    logger.warning(
+                        f"LOW FUNDS: ₹{available:,.2f} available < "
+                        f"₹{cfg.DEPLOY_CAP:,.0f} deploy cap. Trades may be limited."
+                    )
+            except Exception as e:
+                logger.warning(f"Could not verify account funds: {e}")
+
     def _trading_loop(self) -> None:
         """Main trading loop during market hours."""
         logger.info("=== TRADING LOOP STARTED ===")
 
-        skip_minutes = self.config["trading"]["market_hours"].get("skip_first_minutes", 15)
+        cfg = get_config()
+        skip_minutes = cfg.SKIP_FIRST_MINUTES
         trade_start = dt_time(9, 15 + skip_minutes)
-        trade_end = dt_time(15, 10)
+        _te_h, _te_m = (int(x) for x in cfg.TRADE_END.split(":"))
+        trade_end = dt_time(_te_h, _te_m)
 
         # Wait for market open + skip period
         self._wait_until(trade_start)
@@ -619,6 +651,17 @@ class TradingBot:
                         self.options_buyer.record_exit(
                             symbol, trigger["type"], option_type
                         )
+
+                # ── PLUS: Check spread exits ──
+                if get_config().TRADING_STAGE == "PLUS":
+                    spread_exits = self.order_manager.check_spread_exits()
+                    for spread_exit in spread_exits:
+                        logger.info(
+                            f"SPREAD EXIT: {spread_exit['trade_type']} | "
+                            f"reason={spread_exit['exit_reason']} | "
+                            f"P&L=₹{spread_exit['pnl']:,.0f}"
+                        )
+                        self.circuit_breaker.record_trade(spread_exit["pnl"])
 
                 # ── Check trailing stops on options positions ──
                 trail_exits = self.order_manager.check_trailing_stops()
@@ -2043,9 +2086,10 @@ class TradingBot:
         consec_sl_count = 0
         consec_sl_block_days = 0  # Days blocked by 3-SL rule (auto-reset after 5)
 
-        # Circuit breaker simulation
-        cb_daily_loss_warning = 5_000     # ₹5K daily loss → conviction +1.0
-        cb_daily_loss_halt = 10_000       # ₹10K daily loss → halt
+        # Circuit breaker simulation (from EnvConfig)
+        cfg = get_config()
+        cb_daily_loss_halt = cfg.DAILY_LOSS_HALT
+        cb_daily_loss_warning = cb_daily_loss_halt / 2  # Half of halt threshold
         # Active trading mode: 5 trades/day, lower thresholds
         bt_active = getattr(self, "_active_trading", False)
         bt_max_daily_trades = 5 if bt_active else 1  # 1 trade/day (no intraday re-entry in daily backtest)
@@ -2059,10 +2103,19 @@ class TradingBot:
         recent_outcomes: list[bool] = []
         _skip_whipsaw = 0
 
-        # ── Fixed deploy/risk caps (constants) ──
-        BT_MAX_DEPLOY = 25_000       # ₹25K FIXED deploy cap
-        BT_MAX_RISK = 10_000         # ₹10K max risk per trade
-        min_premium = 80
+        # ── Deploy/risk caps (from EnvConfig) ──
+        BT_MAX_DEPLOY = int(cfg.DEPLOY_CAP)
+        BT_MAX_RISK = int(cfg.RISK_PER_TRADE)
+        min_premium = cfg.MIN_PREMIUM
+
+        # ── PLUS stage config ──
+        is_plus = cfg.TRADING_STAGE == "PLUS"
+        if is_plus:
+            SPREAD_WIDTH = cfg.SPREAD_WIDTH
+            DEBIT_SL_PCT = cfg.DEBIT_SPREAD_SL_PCT / 100
+            DEBIT_TP_PCT = cfg.DEBIT_SPREAD_TP_PCT / 100
+            CREDIT_SL_MULT = cfg.CREDIT_SPREAD_SL_MULTIPLIER
+            CREDIT_TP_PCT = cfg.CREDIT_SPREAD_TP_PCT / 100
 
         trading_days = 0
         signals_generated = 0
@@ -2072,11 +2125,11 @@ class TradingBot:
         _skip_consec_sl = 0
         _skip_conviction = 0
 
-        # Regime behavior profiles (constant — matches live RegimeDetector.REGIME_PROFILES)
+        # Regime behavior profiles (conviction thresholds from EnvConfig)
         regime_profiles = {
             "TRENDING": {
                 "size_multiplier": 1.0,
-                "conviction_min": 1.75,      # Lowered from 2.0 (1.5 too aggressive)
+                "conviction_min": cfg.TRENDING_THRESHOLD,
                 "sl_multiplier": 1.0,
                 "tp_multiplier": 1.3,
                 "trailing_stop_enabled": True,
@@ -2086,7 +2139,7 @@ class TradingBot:
             },
             "RANGEBOUND": {
                 "size_multiplier": 0.5,
-                "conviction_min": 2.0,        # Keep at 2.0 (rangebound needs stronger signal)
+                "conviction_min": cfg.RANGEBOUND_THRESHOLD,
                 "sl_multiplier": 0.85,
                 "tp_multiplier": 0.70,
                 "trailing_stop_enabled": False,
@@ -2096,7 +2149,7 @@ class TradingBot:
             },
             "VOLATILE": {
                 "size_multiplier": 0.5,
-                "conviction_min": 2.5,        # Lowered from 3.0 → some volatile trades
+                "conviction_min": cfg.VOLATILE_THRESHOLD,
                 "sl_multiplier": 1.20,
                 "tp_multiplier": 1.50,
                 "trailing_stop_enabled": True,
@@ -2641,21 +2694,49 @@ class TradingBot:
                 elif consec_sl_direction == "PE":
                     bull_score += 0.5
 
-            # ── TRADE TYPE: FULL or SKIP (no CAUTIOUS) ──
-            # Conviction threshold from regime profile
+            # ── TRADE TYPE SELECTION ──
             full_threshold = profile["conviction_min"] + cb_conviction_boost
 
-            if score_diff >= full_threshold:
-                trade_type = "FULL"
+            if is_plus:
+                # PLUS decision tree: VOLATILE→CREDIT, high conviction→NAKED, else→DEBIT
+                if regime == "VOLATILE":
+                    if score_diff >= full_threshold:
+                        trade_type = "CREDIT_SPREAD"
+                    else:
+                        skipped_vix += 1
+                        _skip_conviction += 1
+                        equity_curve.append({
+                            "date": date_str, "equity": round(cash, 2),
+                            "cash": round(cash, 2), "positions_value": 0,
+                            "n_positions": 0, "daily_return": 0,
+                        })
+                        continue
+                elif score_diff >= 3.0 + cb_conviction_boost:
+                    trade_type = "NAKED_BUY"
+                elif score_diff >= full_threshold:
+                    trade_type = "DEBIT_SPREAD"
+                else:
+                    skipped_vix += 1
+                    _skip_conviction += 1
+                    equity_curve.append({
+                        "date": date_str, "equity": round(cash, 2),
+                        "cash": round(cash, 2), "positions_value": 0,
+                        "n_positions": 0, "daily_return": 0,
+                    })
+                    continue
             else:
-                skipped_vix += 1
-                _skip_conviction += 1
-                equity_curve.append({
-                    "date": date_str, "equity": round(cash, 2),
-                    "cash": round(cash, 2), "positions_value": 0,
-                    "n_positions": 0, "daily_return": 0,
-                })
-                continue
+                # BASIC: original logic (unchanged)
+                if score_diff >= full_threshold:
+                    trade_type = "FULL"
+                else:
+                    skipped_vix += 1
+                    _skip_conviction += 1
+                    equity_curve.append({
+                        "date": date_str, "equity": round(cash, 2),
+                        "cash": round(cash, 2), "positions_value": 0,
+                        "n_positions": 0, "daily_return": 0,
+                    })
+                    continue
 
             # Single direction — higher score wins
             if bull_score > bear_score:
@@ -2675,6 +2756,8 @@ class TradingBot:
 
             day_pnl = 0.0
             day_trades = 0
+            bt_naked_today = 0
+            bt_spread_today = 0
             atm_strike = round(open_price / strike_gap) * strike_gap
 
             for direction, dir_score, conviction in directions_to_trade:
@@ -2686,6 +2769,12 @@ class TradingBot:
                     break
                 if day_trades >= max_today + 1:  # Total cap
                     break
+                # PLUS per-type limits: max 2 naked + 2 spreads
+                if is_plus:
+                    if trade_type == "NAKED_BUY" and bt_naked_today >= 2:
+                        continue
+                    if trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD") and bt_spread_today >= 2:
+                        continue
 
                 strike = atm_strike
 
@@ -2731,6 +2820,54 @@ class TradingBot:
                 # Skip if strike too far from ATM (max 3 strikes = 150 points)
                 if real_data is not None and abs(strike - atm_strike) > 3 * strike_gap:
                     real_data = None
+
+                # ── PLUS: Find second leg premium for spreads ──
+                leg2_data = None
+                leg2_strike = 0
+                credit_dir = ""
+                if is_plus and trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD") and real_data is not None:
+                    if trade_type == "DEBIT_SPREAD":
+                        # Buy ATM + Sell OTM (same option type, 200 pts apart)
+                        leg2_strike = strike + SPREAD_WIDTH if direction == "CE" else strike - SPREAD_WIDTH
+                        leg2_data = premium_lookup.get((date_str, leg2_strike, direction))
+                        # Try nearest strike if exact not found
+                        if leg2_data is None:
+                            for offset in [strike_gap, -strike_gap]:
+                                alt = leg2_strike + offset
+                                leg2_data = premium_lookup.get((date_str, alt, direction))
+                                if leg2_data is not None:
+                                    leg2_strike = alt
+                                    break
+                    else:  # CREDIT_SPREAD
+                        # Bullish (CE signal) → Bull Put Spread: SELL near-OTM PE, BUY far-OTM PE
+                        # Bearish (PE signal) → Bear Call Spread: SELL near-OTM CE, BUY far-OTM CE
+                        credit_dir = "PE" if direction == "CE" else "CE"
+                        if credit_dir == "PE":
+                            sell_strike = atm_strike - 100
+                            buy_strike = sell_strike - SPREAD_WIDTH
+                        else:
+                            sell_strike = atm_strike + 100
+                            buy_strike = sell_strike + SPREAD_WIDTH
+                        sell_data = premium_lookup.get((date_str, sell_strike, credit_dir))
+                        buy_data = premium_lookup.get((date_str, buy_strike, credit_dir))
+                        if sell_data is not None and buy_data is not None:
+                            # Override: real_data = sell leg, leg2_data = buy leg (protection)
+                            real_data = sell_data
+                            leg2_data = buy_data
+                            strike = sell_strike
+                            leg2_strike = buy_strike
+                        else:
+                            leg2_data = None
+
+                    if leg2_data is None:
+                        # Cannot construct spread — fallback to naked if high conviction
+                        if score_diff >= 3.0 + cb_conviction_boost and regime != "VOLATILE":
+                            trade_type = "NAKED_BUY"
+                        else:
+                            if data_source == "REAL" if real_data else False:
+                                real_data_trades -= 1
+                            signals_generated -= 1
+                            continue
 
                 if real_data is not None:
                     # ── REAL PREMIUM DATA: Use actual OHLC ──
@@ -2905,37 +3042,112 @@ class TradingBot:
 
                     estimated_trades += 1
 
-                # ── Dynamic lot sizing: ₹25K deploy, risk by trade type ──
+                # ── Dynamic lot sizing: deploy cap AND risk limit ──
                 if entry_premium <= 0:
                     continue
 
-                lots_by_deploy = int(BT_MAX_DEPLOY / (entry_premium * lot_size))
-                lots_by_risk = int(trade_risk / (entry_premium * adj_sl * lot_size)) if adj_sl > 0 else lots_by_deploy
-                bt_lots = min(lots_by_deploy, lots_by_risk)  # No max lots cap
-                bt_lots = max(1, bt_lots)
-                lot_used = bt_lots * lot_size
-
-                position_cost = entry_premium * lot_used
-
-                # Hard cap: skip if even 1 lot exceeds deploy cap
-                if entry_premium * lot_size > BT_MAX_DEPLOY:
-                    if day_trades > 0:
-                        if data_source == "REAL":
-                            real_data_trades -= 1
-                        else:
-                            estimated_trades -= 1
-                        signals_generated -= 1
+                # PLUS spread lot sizing uses net premium / max loss per unit
+                if is_plus and trade_type == "DEBIT_SPREAD" and leg2_data is not None:
+                    leg2_entry = leg2_data["open"]
+                    net_debit = entry_premium - leg2_entry
+                    if net_debit <= 0:
                         continue
-                    lot_used = lot_size
+                    lots_by_deploy = int(BT_MAX_DEPLOY / (net_debit * lot_size))
+                    lots_by_risk = int(BT_MAX_RISK / (net_debit * lot_size))
+                    bt_lots = max(1, min(lots_by_deploy, lots_by_risk))
+                    lot_used = bt_lots * lot_size
+                    position_cost = net_debit * lot_used
+
+                elif is_plus and trade_type == "CREDIT_SPREAD" and leg2_data is not None:
+                    sell_entry = real_data["open"]
+                    buy_entry = leg2_data["open"]
+                    credit = sell_entry - buy_entry
+                    if credit <= 0:
+                        continue
+                    # Max loss per unit = spread_width_in_premium_terms - credit
+                    max_loss_per_unit = (SPREAD_WIDTH / strike_gap) * strike_gap - credit
+                    if max_loss_per_unit <= 0:
+                        max_loss_per_unit = SPREAD_WIDTH
+                    lots_by_risk = int(BT_MAX_RISK / (max_loss_per_unit * lot_size)) if max_loss_per_unit > 0 else 1
+                    bt_lots = max(1, lots_by_risk)
+                    lot_used = bt_lots * lot_size
+                    position_cost = credit * lot_used  # Credit received (for pnl_pct)
+
+                else:
+                    # BASIC / NAKED_BUY: original lot sizing (unchanged)
+                    lots_by_deploy = int(BT_MAX_DEPLOY / (entry_premium * lot_size))
+                    actual_sl = prem_sl if prem_sl > 0 else adj_sl
+                    lots_by_risk = int(trade_risk / (entry_premium * actual_sl * lot_size)) if actual_sl > 0 else lots_by_deploy
+                    bt_lots = min(lots_by_deploy, lots_by_risk)
+                    bt_lots = max(1, bt_lots)
+                    lot_used = bt_lots * lot_size
                     position_cost = entry_premium * lot_used
 
-                # ── Calculate P&L ──
-                gross_pnl = (exit_premium - entry_premium) * lot_used
-                stt = exit_premium * lot_used * stt_sell_pct
-                total_charges = brokerage_per_order * 2 + stt
+                    # Hard cap: skip if even 1 lot exceeds deploy cap
+                    if entry_premium * lot_size > BT_MAX_DEPLOY:
+                        if day_trades > 0:
+                            if data_source == "REAL":
+                                real_data_trades -= 1
+                            else:
+                                estimated_trades -= 1
+                            signals_generated -= 1
+                            continue
+                        lot_used = lot_size
+                        position_cost = entry_premium * lot_used
 
-                net_pnl = gross_pnl - total_charges
-                pnl_pct = (net_pnl / position_cost) * 100
+                # ── Calculate P&L ──
+                if is_plus and trade_type == "DEBIT_SPREAD" and leg2_data is not None:
+                    # Debit Spread P&L: BUY leg gain + SELL leg gain
+                    leg1_entry = entry_premium
+                    leg2_entry_p = leg2_data["open"]
+                    net_debit_pnl = leg1_entry - leg2_entry_p
+                    leg1_exit = exit_premium
+                    leg2_exit = leg2_data["close"]
+                    gross_pnl = ((leg1_exit - leg1_entry) + (leg2_entry_p - leg2_exit)) * lot_used
+                    # Clamp to spread SL/TP
+                    max_loss_amt = net_debit_pnl * DEBIT_SL_PCT * lot_used
+                    max_profit_amt = ((SPREAD_WIDTH / strike_gap * strike_gap) - net_debit_pnl) * DEBIT_TP_PCT * lot_used
+                    if gross_pnl <= -max_loss_amt:
+                        gross_pnl = -max_loss_amt
+                        exit_reason = "spread_sl"
+                    elif gross_pnl >= max_profit_amt:
+                        gross_pnl = max_profit_amt
+                        exit_reason = "spread_tp"
+                    stt = abs(exit_premium) * lot_used * stt_sell_pct
+                    total_charges = brokerage_per_order * 4 + stt  # 4 legs total
+                    net_pnl = gross_pnl - total_charges
+                    pnl_pct = (net_pnl / (net_debit_pnl * lot_used)) * 100 if net_debit_pnl > 0 else 0
+
+                elif is_plus and trade_type == "CREDIT_SPREAD" and leg2_data is not None:
+                    # Credit Spread P&L: credit received - cost to close
+                    sell_entry_p = real_data["open"]
+                    buy_entry_p = leg2_data["open"]
+                    credit_received = sell_entry_p - buy_entry_p
+                    sell_exit_p = real_data["close"]
+                    buy_exit_p = leg2_data["close"]
+                    close_cost = sell_exit_p - buy_exit_p
+                    gross_pnl = (credit_received - close_cost) * lot_used
+                    # Clamp to SL/TP
+                    if gross_pnl <= -credit_received * CREDIT_SL_MULT * lot_used:
+                        gross_pnl = -credit_received * CREDIT_SL_MULT * lot_used
+                        exit_reason = "spread_sl"
+                    elif gross_pnl >= credit_received * CREDIT_TP_PCT * lot_used:
+                        gross_pnl = credit_received * CREDIT_TP_PCT * lot_used
+                        exit_reason = "spread_tp"
+                    else:
+                        exit_reason = "eod_exit"
+                    stt = abs(sell_exit_p) * lot_used * stt_sell_pct
+                    total_charges = brokerage_per_order * 4 + stt
+                    net_pnl = gross_pnl - total_charges
+                    pnl_pct = (net_pnl / max(credit_received * lot_used, 1)) * 100
+
+                else:
+                    # BASIC / NAKED_BUY: original P&L (unchanged)
+                    gross_pnl = (exit_premium - entry_premium) * lot_used
+                    stt = exit_premium * lot_used * stt_sell_pct
+                    total_charges = brokerage_per_order * 2 + stt
+                    net_pnl = gross_pnl - total_charges
+                    pnl_pct = (net_pnl / position_cost) * 100
 
                 # Update streak + whipsaw tracker
                 if net_pnl > 0:
@@ -2949,7 +3161,8 @@ class TradingBot:
                     recent_outcomes.pop(0)
 
                 # Update consecutive SL tracker
-                if exit_reason == "stop_loss":
+                is_sl = exit_reason in ("stop_loss", "spread_sl")
+                if is_sl:
                     same_day_sl_count += 1
                     if direction == consec_sl_direction:
                         consec_sl_count += 1
@@ -2962,26 +3175,91 @@ class TradingBot:
                     consec_sl_block_days = 0
 
                 # ── Record trade ──
-                option_symbol = f"NIFTY{int(strike)}{direction}"
-                trade = BacktestTrade(
-                    symbol=option_symbol,
-                    side="BUY",
-                    quantity=lot_used,
-                    entry_price=round(entry_premium, 2),
-                    exit_price=round(exit_premium, 2),
-                    entry_date=date_str,
-                    exit_date=date_str,
-                    strategy=trade_type,  # "FULL"
-                    regime=regime,
-                    stop_loss=round(sl_price, 2),
-                    take_profit=round(tp_price, 2),
-                    charges=round(total_charges, 2),
-                    slippage=0,
-                    pnl=round(net_pnl, 2),
-                    pnl_pct=round(pnl_pct, 2),
-                    hold_days=0,
-                    exit_reason=exit_reason,
-                )
+                if is_plus and trade_type == "DEBIT_SPREAD" and leg2_data is not None:
+                    option_symbol = f"NIFTY{int(strike)}{direction}"
+                    l2_sym = f"NIFTY{int(leg2_strike)}{direction}"
+                    trade = BacktestTrade(
+                        symbol=option_symbol,
+                        side="BUY",
+                        quantity=lot_used,
+                        entry_price=round(entry_premium, 2),
+                        exit_price=round(exit_premium, 2),
+                        entry_date=date_str,
+                        exit_date=date_str,
+                        strategy=trade_type,
+                        regime=regime,
+                        stop_loss=round(sl_price, 2),
+                        take_profit=round(tp_price, 2),
+                        charges=round(total_charges, 2),
+                        slippage=0,
+                        pnl=round(net_pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        hold_days=0,
+                        exit_reason=exit_reason,
+                        trade_type=trade_type,
+                        leg2_symbol=l2_sym,
+                        leg2_side="SELL",
+                        leg2_entry_price=round(leg2_data["open"], 2),
+                        leg2_exit_price=round(leg2_data["close"], 2),
+                        spread_width=SPREAD_WIDTH,
+                        net_premium=round(net_debit_pnl, 2),
+                        max_profit=round(max_profit_amt, 2),
+                        max_loss=round(net_debit_pnl * lot_used, 2),
+                    )
+                elif is_plus and trade_type == "CREDIT_SPREAD" and leg2_data is not None:
+                    option_symbol = f"NIFTY{int(strike)}{credit_dir}"
+                    l2_sym = f"NIFTY{int(leg2_strike)}{credit_dir}"
+                    trade = BacktestTrade(
+                        symbol=option_symbol,
+                        side="SELL",
+                        quantity=lot_used,
+                        entry_price=round(sell_entry_p, 2),
+                        exit_price=round(sell_exit_p, 2),
+                        entry_date=date_str,
+                        exit_date=date_str,
+                        strategy=trade_type,
+                        regime=regime,
+                        stop_loss=0,
+                        take_profit=0,
+                        charges=round(total_charges, 2),
+                        slippage=0,
+                        pnl=round(net_pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        hold_days=0,
+                        exit_reason=exit_reason,
+                        trade_type=trade_type,
+                        leg2_symbol=l2_sym,
+                        leg2_side="BUY",
+                        leg2_entry_price=round(buy_entry_p, 2),
+                        leg2_exit_price=round(buy_exit_p, 2),
+                        spread_width=SPREAD_WIDTH,
+                        net_premium=round(credit_received, 2),
+                        max_profit=round(credit_received * lot_used, 2),
+                        max_loss=round(max_loss_per_unit * lot_used, 2),
+                    )
+                else:
+                    # BASIC / NAKED_BUY: original (unchanged)
+                    option_symbol = f"NIFTY{int(strike)}{direction}"
+                    trade = BacktestTrade(
+                        symbol=option_symbol,
+                        side="BUY",
+                        quantity=lot_used,
+                        entry_price=round(entry_premium, 2),
+                        exit_price=round(exit_premium, 2),
+                        entry_date=date_str,
+                        exit_date=date_str,
+                        strategy=trade_type,  # "FULL" or "NAKED_BUY"
+                        regime=regime,
+                        stop_loss=round(sl_price, 2),
+                        take_profit=round(tp_price, 2),
+                        charges=round(total_charges, 2),
+                        slippage=0,
+                        pnl=round(net_pnl, 2),
+                        pnl_pct=round(pnl_pct, 2),
+                        hold_days=0,
+                        exit_reason=exit_reason,
+                        trade_type="NAKED_BUY" if is_plus else "NAKED_BUY",
+                    )
                 trades.append(trade)
 
                 cash += net_pnl
@@ -2989,6 +3267,11 @@ class TradingBot:
                 day_trades += 1
 
                 full_trades_today += 1
+                if is_plus:
+                    if trade_type == "NAKED_BUY":
+                        bt_naked_today += 1
+                    elif trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD"):
+                        bt_spread_today += 1
 
                 # ── Circuit breaker: absolute loss thresholds ──
                 daily_loss_abs = abs(day_pnl) if day_pnl < 0 else 0
@@ -3004,12 +3287,19 @@ class TradingBot:
 
                 if len(sample_trades) < 15:
                     pnl_sign = "+" if net_pnl >= 0 else ""
-                    premium_change_pct = ((exit_premium - entry_premium) / entry_premium) * 100
-                    sample_trades.append(
-                        f"  {date_str}: [F] {direction} {option_symbol} @ ₹{entry_premium:.2f} "
-                        f"→ ₹{exit_premium:.2f} ({premium_change_pct:+.1f}% {exit_reason}) "
-                        f"{pnl_sign}₹{net_pnl:,.2f} [{bt_lots}L {lot_used}q]"
-                    )
+                    tt_label = trade_type[0] if is_plus else "F"  # N/D/C or F
+                    if is_plus and trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD"):
+                        sample_trades.append(
+                            f"  {date_str}: [{tt_label}] {option_symbol} spread "
+                            f"{pnl_sign}₹{net_pnl:,.2f} [{bt_lots}L {lot_used}q] {exit_reason}"
+                        )
+                    else:
+                        premium_change_pct = ((exit_premium - entry_premium) / entry_premium) * 100
+                        sample_trades.append(
+                            f"  {date_str}: [{tt_label}] {direction} {option_symbol} @ ₹{entry_premium:.2f} "
+                            f"→ ₹{exit_premium:.2f} ({premium_change_pct:+.1f}% {exit_reason}) "
+                            f"{pnl_sign}₹{net_pnl:,.2f} [{bt_lots}L {lot_used}q]"
+                        )
 
             # ── End of day equity curve ──
             prev_equity = equity_curve[-1]["equity"] if equity_curve else capital
@@ -3123,7 +3413,7 @@ class TradingBot:
             ["Largest Win", f"₹{trades_data.get('largest_win', 0):,.2f}"],
             ["Largest Loss", f"₹{trades_data.get('largest_loss', 0):,.2f}"],
             ["Avg Premium", f"₹{avg_premium:.2f}"],
-            ["Lot Size", f"{lot_size} (dynamic lots, ₹25K deploy cap)"],
+            ["Lot Size", f"{lot_size} (dynamic lots, ₹{BT_MAX_DEPLOY/1000:.0f}K deploy cap)"],
             ["Avg Qty", f"{sum(t.quantity for t in trades) / len(trades):.0f}"],
             ["Avg Position Size", f"₹{sum(t.entry_price * t.quantity for t in trades) / len(trades):,.2f}"],
             ["Total Charges", f"₹{costs.get('total_charges', 0):,.2f}"],
@@ -3138,18 +3428,25 @@ class TradingBot:
                 exit_rows.append([reason.replace("_", " ").title(), str(int(count)), f"{pct:.0f}%"])
             print_table("EXIT REASONS", ["Exit Type", "Count", "%"], exit_rows, [20, 8, 8])
 
-        # ── 4. CE vs PE Breakdown Table ──
+        # ── 4. Direction Breakdown Table ──
         if trades:
-            ce_trades = [t for t in trades if "CE" in t.symbol]
-            pe_trades = [t for t in trades if "PE" in t.symbol]
-            ce_pnl = sum(t.pnl for t in ce_trades)
-            pe_pnl = sum(t.pnl for t in pe_trades)
-            ce_wr = sum(1 for t in ce_trades if t.pnl > 0) / len(ce_trades) * 100 if ce_trades else 0
-            pe_wr = sum(1 for t in pe_trades if t.pnl > 0) / len(pe_trades) * 100 if pe_trades else 0
-            print_table("CE vs PE BREAKDOWN", ["Direction", "Trades", "P&L", "Win Rate"], [
-                ["CE (Call)", str(len(ce_trades)), f"{'+'if ce_pnl>=0 else ''}₹{ce_pnl:,.2f}", f"{ce_wr:.1f}%"],
-                ["PE (Put)", str(len(pe_trades)), f"{'+'if pe_pnl>=0 else ''}₹{pe_pnl:,.2f}", f"{pe_wr:.1f}%"],
-            ], [14, 10, 16, 10])
+            ce_buy = [t for t in trades if "CE" in t.symbol and t.side == "BUY"]
+            ce_sell = [t for t in trades if "CE" in t.symbol and t.side == "SELL"]
+            pe_buy = [t for t in trades if "PE" in t.symbol and t.side == "BUY"]
+            pe_sell = [t for t in trades if "PE" in t.symbol and t.side == "SELL"]
+            dir_rows = []
+            for label, group in [("CE Buy", ce_buy), ("CE Sell", ce_sell), ("PE Buy", pe_buy), ("PE Sell", pe_sell)]:
+                if not group:
+                    dir_rows.append([label, "0", "₹0", "-"])
+                    continue
+                g_pnl = sum(t.pnl for t in group)
+                g_wr = sum(1 for t in group if t.pnl > 0) / len(group) * 100
+                dir_rows.append([label, str(len(group)), f"{'+'if g_pnl>=0 else ''}₹{g_pnl:,.2f}", f"{g_wr:.1f}%"])
+            # Total row
+            total_pnl = sum(t.pnl for t in trades)
+            total_wr = sum(1 for t in trades if t.pnl > 0) / len(trades) * 100
+            dir_rows.append(["TOTAL", str(len(trades)), f"{'+'if total_pnl>=0 else ''}₹{total_pnl:,.2f}", f"{total_wr:.1f}%"])
+            print_table("DIRECTION BREAKDOWN", ["Direction", "Trades", "P&L", "Win Rate"], dir_rows, [14, 10, 16, 10])
 
         # ── 5. Monthly Breakdown Table ──
         if monthly:
@@ -3168,8 +3465,11 @@ class TradingBot:
                     status,
                 ])
             profitable_months = sum(1 for r in month_rows if r[4] == "Profit")
+            total_monthly_pnl = sum(t.pnl for t in trades)
+            avg_monthly_pnl = total_monthly_pnl / len(month_rows) if month_rows else 0
             print_table("MONTHLY BREAKDOWN", ["Month", "P&L", "Trades", "WR", "Status"], month_rows, [12, 16, 8, 6, 8])
             logger.info(f"  Profitable Months: {profitable_months}/{len(month_rows)} ({profitable_months/len(month_rows)*100:.0f}%)")
+            logger.info(f"  Avg Monthly P&L: ₹{avg_monthly_pnl:,.2f}")
 
         # ── 6. Regime Performance Table ──
         if regime_perf:
@@ -3293,7 +3593,8 @@ class TradingBot:
         # ── 10. TRADE TYPE PERFORMANCE ──
         if trades:
             type_rows = []
-            for ttype in ["FULL"]:
+            types_to_show = ["NAKED_BUY", "DEBIT_SPREAD", "CREDIT_SPREAD"] if is_plus else ["FULL"]
+            for ttype in types_to_show:
                 tt_trades = [t for t in trades if t.strategy == ttype]
                 if not tt_trades:
                     type_rows.append([ttype, "0", "₹0", "0%", "0.00"])
@@ -3313,10 +3614,11 @@ class TradingBot:
                     f"{tt_pf:.2f}",
                     f"{tt_avg_qty:.0f}",
                 ])
-            print_table("TRADE TYPE PERFORMANCE", ["Type", "Trades", "P&L", "WR", "PF", "Avg Qty"], type_rows, [10, 8, 16, 8, 8, 10])
+            tt_col_w = 16 if is_plus else 10
+            print_table("TRADE TYPE PERFORMANCE", ["Type", "Trades", "P&L", "WR", "PF", "Avg Qty"], type_rows, [tt_col_w, 8, 16, 8, 8, 10])
 
-        # ── 11. All Trades Detail ──
-        if trades:
+        # ── 11. All Trades Detail (only with --daily flag) ──
+        if trades and getattr(self, "_show_daily_trades", False):
             trade_rows = []
             running_pnl = 0.0
             for idx, t in enumerate(trades, 1):
@@ -3324,9 +3626,11 @@ class TradingBot:
                 pnl_sign = "+" if t.pnl >= 0 else ""
                 prem_chg = ((t.exit_price - t.entry_price) / t.entry_price * 100) if t.entry_price > 0 else 0
                 lot_cost = t.entry_price * t.quantity
+                direction = "BUY" if "CE" in t.symbol else "SELL"
                 trade_rows.append([
                     str(idx),
                     t.entry_date,
+                    direction,
                     t.strategy[:4],
                     t.symbol,
                     f"₹{t.entry_price:.2f}",
@@ -3341,9 +3645,9 @@ class TradingBot:
                 ])
             print_table(
                 f"ALL TRADES ({len(trades)} trades)",
-                ["#", "Date", "Type", "Symbol", "Entry", "Qty", "Cost", "Exit", "Chg%", "Exit Type", "P&L", "Cumul", "Rgm"],
+                ["#", "Date", "Dir", "Type", "Symbol", "Entry", "Qty", "Cost", "Exit", "Chg%", "Exit Type", "P&L", "Cumul", "Rgm"],
                 trade_rows,
-                [5, 12, 6, 18, 10, 5, 12, 10, 7, 14, 14, 14, 6],
+                [5, 12, 5, 6, 18, 10, 5, 12, 10, 7, 14, 14, 14, 6],
             )
 
         # ── 12. VALIDATION ──
@@ -3355,31 +3659,73 @@ class TradingBot:
 
             violations = 0
 
-            # V1: No position cost > ₹25K
-            max_cost_trade = max(trades, key=lambda t: t.entry_price * t.quantity)
-            max_cost = max_cost_trade.entry_price * max_cost_trade.quantity
+            # V1: No position cost > deploy cap
+            def _trade_cost(t):
+                if t.trade_type in ("DEBIT_SPREAD",):
+                    return t.net_premium * t.quantity  # Spread cost = net premium
+                elif t.trade_type in ("CREDIT_SPREAD",):
+                    return 0  # Credit spreads have no upfront cost
+                return t.entry_price * t.quantity
+            max_cost_trade = max(trades, key=_trade_cost)
+            max_cost = _trade_cost(max_cost_trade)
             v1_pass = max_cost <= BT_MAX_DEPLOY
             if not v1_pass:
                 violations += 1
-            logger.info(f"  [{'PASS' if v1_pass else 'FAIL'}] Deploy cap ₹25K: max position cost = ₹{max_cost:,.2f}")
+            logger.info(f"  [{'PASS' if v1_pass else 'FAIL'}] Deploy cap ₹{BT_MAX_DEPLOY/1000:.0f}K: max position cost = ₹{max_cost:,.2f}")
 
-            # V2: Risk ≤ ₹10K per trade
+            # V2: Risk ≤ max risk per trade
             risk_violations = 0
             for t in trades:
-                sl_loss = abs(t.entry_price - t.stop_loss) * t.quantity
-                if sl_loss > BT_MAX_RISK * 1.1:  # 10% tolerance for rounding
-                    risk_violations += 1
+                if t.trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD"):
+                    # Spread risk = max_loss field
+                    if t.max_loss > BT_MAX_RISK * 1.1:
+                        risk_violations += 1
+                else:
+                    sl_loss = abs(t.entry_price - t.stop_loss) * t.quantity
+                    if sl_loss > BT_MAX_RISK * 1.1:  # 10% tolerance for rounding
+                        risk_violations += 1
             v2_pass = risk_violations == 0
             if not v2_pass:
                 violations += 1
-            logger.info(f"  [{'PASS' if v2_pass else 'FAIL'}] Risk ≤ ₹10K: {risk_violations} violations ({len(trades)} trades)")
+            logger.info(f"  [{'PASS' if v2_pass else 'FAIL'}] Risk ≤ ₹{BT_MAX_RISK/1000:.0f}K: {risk_violations} violations ({len(trades)} trades)")
 
-            # V3: Min premium ≥ ₹80
-            min_prem_trade = min(trades, key=lambda t: t.entry_price)
-            v7_pass = min_prem_trade.entry_price >= 80.0
+            # V3: Min premium ≥ threshold
+            naked_trades_v = [t for t in trades if t.trade_type not in ("DEBIT_SPREAD", "CREDIT_SPREAD")]
+            if naked_trades_v:
+                min_prem_trade = min(naked_trades_v, key=lambda t: t.entry_price)
+                v7_pass = min_prem_trade.entry_price >= min_premium
+            else:
+                v7_pass = True
+                min_prem_trade = None
             if not v7_pass:
                 violations += 1
-            logger.info(f"  [{'PASS' if v7_pass else 'FAIL'}] Min premium ₹80: min = ₹{min_prem_trade.entry_price:.2f}")
+            min_prem_val = min_prem_trade.entry_price if min_prem_trade else 0
+            logger.info(f"  [{'PASS' if v7_pass else 'FAIL'}] Min premium ₹{min_premium}: min = ₹{min_prem_val:.2f}")
+
+            # ── PLUS-specific validations ──
+            if is_plus:
+                # V4: No naked sells (every SELL has protection leg)
+                sell_trades = [t for t in trades if t.side == "SELL"]
+                naked_sells = [t for t in sell_trades if not t.leg2_symbol]
+                v4_pass = len(naked_sells) == 0
+                if not v4_pass:
+                    violations += 1
+                logger.info(f"  [{'PASS' if v4_pass else 'FAIL'}] No naked sells: {len(naked_sells)} violations ({len(sell_trades)} sell trades)")
+
+                # V5: Spread width matches config
+                spread_trades_v = [t for t in trades if t.spread_width > 0]
+                width_ok = all(t.spread_width == SPREAD_WIDTH for t in spread_trades_v)
+                v5_pass = width_ok or len(spread_trades_v) == 0
+                if not v5_pass:
+                    violations += 1
+                logger.info(f"  [{'PASS' if v5_pass else 'FAIL'}] Spread width = {SPREAD_WIDTH}: {len(spread_trades_v)} spreads checked")
+
+                # V6: Max loss per spread within risk cap
+                spread_risk_violations = sum(1 for t in spread_trades_v if t.max_loss > BT_MAX_RISK * 1.1)
+                v6_pass = spread_risk_violations == 0
+                if not v6_pass:
+                    violations += 1
+                logger.info(f"  [{'PASS' if v6_pass else 'FAIL'}] Spread risk ≤ ₹{BT_MAX_RISK/1000:.0f}K: {spread_risk_violations} violations")
 
             # Summary
             logger.info("")
@@ -3388,6 +3734,45 @@ class TradingBot:
             else:
                 logger.info(f"  {violations} VALIDATION(S) FAILED — review above")
             logger.info("=" * 70)
+
+    def _check_market_schedule(self) -> str:
+        """Check if today is a trading day and current time status.
+
+        Returns:
+            "closed_day"  — weekend or holiday
+            "closed_time" — past SQUARE_OFF_TIME
+            "wait"        — before TRADE_START, need to wait
+            "trade"       — within trading window
+        """
+        from src.utils.market_calendar import is_trading_day, next_trading_day
+
+        cfg = get_config()
+        today = date.today()
+        is_open, reason = is_trading_day(today)
+
+        if not is_open:
+            nxt = next_trading_day(today)
+            logger.info(
+                f"Market closed ({reason}). "
+                f"Next session: {nxt.strftime('%A %d %b %Y')}"
+            )
+            return "closed_day"
+
+        now = datetime.now().time()
+        sq_h, sq_m = (int(x) for x in cfg.SQUARE_OFF_TIME.split(":"))
+        if now >= dt_time(sq_h, sq_m):
+            nxt = next_trading_day(today)
+            logger.info(
+                f"Market closed for today (past {cfg.SQUARE_OFF_TIME}). "
+                f"Next session: {nxt.strftime('%A %d %b %Y')}"
+            )
+            return "closed_time"
+
+        ts_h, ts_m = (int(x) for x in cfg.TRADE_START.split(":"))
+        if now < dt_time(ts_h, ts_m):
+            return "wait"
+
+        return "trade"
 
     def _wait_until(self, target: dt_time) -> None:
         """Wait until a specific time of day. Skipped if --no-wait."""
@@ -3403,8 +3788,17 @@ class TradingBot:
         wait_seconds = (target_dt - datetime.now()).total_seconds()
         if wait_seconds > 0 and self._running:
             logger.info(f"Waiting until {target.strftime('%H:%M')} ({wait_seconds/60:.0f} min)")
-            # Sleep in chunks for graceful shutdown
+            last_log = 0.0
             while wait_seconds > 0 and self._running:
+                now_ts = time.time()
+                if now_ts - last_log >= 60:
+                    remaining = (target_dt - datetime.now()).total_seconds()
+                    now_str = datetime.now().strftime("%H:%M")
+                    logger.info(
+                        f"Waiting... {now_str} | Target: {target.strftime('%H:%M')} | "
+                        f"{max(0, remaining / 60):.0f} min remaining"
+                    )
+                    last_log = now_ts
                 time.sleep(min(wait_seconds, 10))
                 wait_seconds -= 10
 
@@ -3456,11 +3850,15 @@ def main():
         action="store_true",
         help="Active trading mode: 5 trades/day, direction unlocked, lower VOLATILE threshold, 15-min cooldown, 2 SL halt",
     )
+    parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="Show individual trade details in backtest output",
+    )
 
     args = parser.parse_args()
 
-    # Load .env file (secrets)
-    _load_dotenv(os.path.join(_project_root, ".env"))
+    # .env loaded automatically by src.config.env_loader at import time
 
     Path("logs").mkdir(exist_ok=True)
     Path("data").mkdir(exist_ok=True)
@@ -3478,6 +3876,8 @@ def main():
         bot.options_buyer.set_active_trading(True)
     if args.capital and args.mode == "backtest":
         bot._backtest_capital = args.capital
+    if args.daily:
+        bot._show_daily_trades = True
     bot.run()
 
 

@@ -10,7 +10,7 @@ LAYER 1: Regime Detection (VIX + NIFTY trend + ADX)
 LAYER 2: 8-Factor Scoring (EMA trend, mean reversion, RSI, MACD,
          Bollinger, MFI, ADX, volume) with regime-adaptive weights
     ↓
-LAYER 3: ML Ensemble (LightGBM + XGBoost + CatBoost, auto-governance)
+LAYER 3: ML Predictor (LightGBM; XGBoost/CatBoost optional for backtest)
     ↓
 LAYER 4: Options Buyer (directional NIFTY options, ATM strike selection)
     ↓
@@ -91,6 +91,7 @@ python src/main.py --mode live
 ```
 ├── config/
 │   ├── config.yaml          # Upstox config, universe, risk params
+│   ├── risk.yaml            # Risk management & circuit breaker params
 │   └── strategies.yaml      # Strategy parameters
 ├── src/
 │   ├── data/
@@ -99,7 +100,7 @@ python src/main.py --mode live
 │   │   ├── features.py      # Technical indicators + alternative data
 │   │   └── options_instruments.py  # F&O instrument key resolver
 │   ├── regime/              # Market regime detection
-│   ├── strategies/          # 5 strategies + ensemble
+│   ├── strategies/          # 5 strategies (3 active, 2 disabled) + ensemble
 │   ├── risk/                # Position sizing, portfolio, circuit breakers
 │   ├── execution/           # Upstox broker, paper trader, order management
 │   ├── utils/               # Market calendar (expiry day checks)
@@ -116,10 +117,10 @@ python src/main.py --mode live
 
 ## Key Details
 
-- **Capital**: ₹25,000 | **Universe**: NIFTY 50 stocks
+- **Capital**: ₹50,000 | **Universe**: NIFTY 50 stocks
 - **Options**: NIFTY weekly options, intraday only, ATM strike selection
 - **Options Risk**: VIX-adaptive SL/TP (20-36% SL, 22-86% TP based on regime), trailing stops, max 1 lot, force exit 15:10 (13:30 on expiry days)
-- **ML Model**: 3-model ensemble (LightGBM + XGBoost + CatBoost), 120-day walk-forward training, auto-governance (disables if accuracy < 50%)
+- **ML Model**: LightGBM predictor (XGBoost/CatBoost optional for backtest), 120-day walk-forward training, auto-governance (disables if accuracy < 50%)
 - **Regime Profiles**: TRENDING (conviction 1.75), RANGEBOUND (2.0), VOLATILE (2.5) — each with tuned SL/TP/sizing
 - **Expiry Day Trading**: Allowed before 1 PM with wider SL (+5%) and theta decay penalty
 - **Expiry**: NIFTY weekly expiry = Tuesday

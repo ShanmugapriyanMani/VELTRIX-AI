@@ -46,6 +46,16 @@ class BacktestTrade:
     pnl_pct: float = 0.0
     hold_days: int = 0
     exit_reason: str = ""
+    # ── PLUS spread fields (defaults preserve BASIC compatibility) ──
+    trade_type: str = "NAKED_BUY"
+    leg2_symbol: str = ""
+    leg2_side: str = ""
+    leg2_entry_price: float = 0.0
+    leg2_exit_price: float = 0.0
+    spread_width: int = 0
+    net_premium: float = 0.0
+    max_profit: float = 0.0
+    max_loss: float = 0.0
 
 
 class BacktestEngine:

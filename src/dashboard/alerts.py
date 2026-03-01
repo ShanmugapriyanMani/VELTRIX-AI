@@ -6,13 +6,14 @@ Bot commands: /status /positions /pnl /regime /kill
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, date
 from typing import Any
 
 import requests
 import yaml
 from loguru import logger
+
+from src.config.env_loader import get_config
 
 
 class TelegramAlerts:
@@ -41,9 +42,9 @@ class TelegramAlerts:
 
         tg_cfg = config.get("alerts", {}).get("telegram", {})
         self.enabled = tg_cfg.get("enabled", False)
-        # Env vars take priority over config file
-        self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", tg_cfg.get("bot_token", ""))
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", tg_cfg.get("chat_id", ""))
+        cfg = get_config()
+        self.bot_token = cfg.TELEGRAM_BOT_TOKEN or tg_cfg.get("bot_token", "")
+        self.chat_id = cfg.TELEGRAM_CHAT_ID or tg_cfg.get("chat_id", "")
 
         if self.enabled and (not self.bot_token or not self.chat_id):
             logger.warning("Telegram alerts enabled but token/chat_id missing")

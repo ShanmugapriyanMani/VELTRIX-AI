@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from src.config.env_loader import get_config
 from src.execution.broker import BaseBroker
 
 
@@ -25,10 +26,12 @@ class PaperTrader(BaseBroker):
 
     def __init__(
         self,
-        initial_capital: float = 500000,
+        initial_capital: float = 0,
         slippage_pct: float = 0.05,
         data_fetcher: Any = None,
     ):
+        if initial_capital <= 0:
+            initial_capital = get_config().TRADING_CAPITAL
         self.initial_capital = initial_capital
         self.available_cash = initial_capital
         self.slippage_pct = slippage_pct / 100
@@ -257,6 +260,29 @@ class PaperTrader(BaseBroker):
             except Exception as e:
                 logger.warning(f"Paper get_ltp failed for {instrument_key}: {e}")
         return {"ltp": 0}
+
+    def place_spread_order(
+        self,
+        leg1_symbol: str, leg1_key: str, leg1_qty: int, leg1_side: str, leg1_price: float,
+        leg2_symbol: str, leg2_key: str, leg2_qty: int, leg2_side: str, leg2_price: float,
+    ) -> dict[str, Any]:
+        """Atomic two-leg spread order with rollback on failure."""
+        result1 = self.place_order(leg1_symbol, leg1_key, leg1_qty, leg1_side, price=leg1_price)
+        if result1.get("status") != "success":
+            return {"status": "error", "reason": "Leg 1 failed", "detail": result1}
+
+        result2 = self.place_order(leg2_symbol, leg2_key, leg2_qty, leg2_side, price=leg2_price)
+        if result2.get("status") != "success":
+            # Rollback leg 1
+            rollback_side = "SELL" if leg1_side == "BUY" else "BUY"
+            self.place_order(leg1_symbol, leg1_key, leg1_qty, rollback_side, price=leg1_price)
+            return {"status": "error", "reason": "Leg 2 failed, rolled back leg 1"}
+
+        return {
+            "status": "success",
+            "leg1_order_id": result1["order_id"],
+            "leg2_order_id": result2["order_id"],
+        }
 
     def square_off_all(self) -> dict[str, Any]:
         squared = 0

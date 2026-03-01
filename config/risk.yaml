@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════
-# RISK MANAGEMENT — VELTRIX V4 / ₹25K capital
+# RISK MANAGEMENT — VELTRIX V4 / ₹50K capital
 # ═══════════════════════════════════════════
-# ₹25K deploy cap, ₹10K max risk per trade.
+# ₹50K capital, ₹25K deploy cap, ₹10K max risk per trade.
 # Dynamic lots (1-7), min confidence 0.70 filters out noise.
 
 # ─────────────────────────────────────────
@@ -40,6 +40,8 @@ stops:
 # ─────────────────────────────────────────
 circuit_breakers:
   daily_loss:
+    warning_pct: 10.0                  # 10% daily loss → WARNING (conviction +1.0)
+    threshold_pct: 20.0                # 20% daily loss → HALT
     warning_amount: 5000               # ₹5K daily loss → conviction +1.0
     halt_amount: 10000                 # ₹10K daily loss → halt
     action: "halt_day"

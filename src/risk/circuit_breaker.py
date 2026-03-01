@@ -28,6 +28,8 @@ from typing import Any, Optional
 import yaml
 from loguru import logger
 
+from src.config.env_loader import get_config, _env_is_set
+
 
 class BreakerState(str, Enum):
     NORMAL = "NORMAL"
@@ -112,6 +114,11 @@ class CircuitBreaker:
         self.max_daily_orders = cb_cfg.get("max_daily_orders", 50)
         self.max_open_positions = cb_cfg.get("max_open_positions", 10)
         self.max_orders_per_minute = cb_cfg.get("max_orders_per_minute", 10)
+
+        # EnvConfig overlay
+        cfg = get_config()
+        if _env_is_set("MAX_TRADES_PER_DAY"):
+            self.max_daily_trades = cfg.MAX_TRADES_PER_DAY
 
         # Weekly/monthly loss tiers
         wl_cfg = cb_cfg.get("weekly_loss", {})
@@ -252,8 +259,10 @@ class CircuitBreaker:
 
         return self._get_status(daily_loss_pct, drawdown_pct, open_positions)
 
-    def record_trade(self, pnl: float, capital: float = 25000.0) -> None:
+    def record_trade(self, pnl: float, capital: float = 0) -> None:
         """Record a trade result for consecutive loss and weekly/monthly tracking."""
+        if capital <= 0:
+            capital = get_config().TRADING_CAPITAL
         self._daily_trades += 1
 
         if pnl < 0:

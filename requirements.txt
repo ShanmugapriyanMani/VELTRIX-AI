@@ -6,6 +6,7 @@
 numpy>=1.24.0
 pandas>=2.0.0
 pyyaml>=6.0
+python-dotenv>=1.0.0
 loguru>=0.7.0
 requests>=2.31.0
 
@@ -15,6 +16,8 @@ upstox-python-sdk>=2.19.0
 # Machine Learning
 lightgbm>=4.1.0
 scikit-learn>=1.3.0
+# xgboost>=2.0.0          # Optional: backtest ensemble
+# catboost>=1.2.0          # Optional: backtest ensemble
 
 # External Data Sources
 yfinance>=1.2.0
@@ -36,12 +39,6 @@ python-telegram-bot>=20.6
 # Testing
 pytest>=7.4.0
 pytest-cov>=4.1.0
-
-# Async Support
-aiohttp>=3.9.0
-
-# Deployment
-docker>=6.1.0
 
 # Type checking (dev)
 mypy>=1.7.0

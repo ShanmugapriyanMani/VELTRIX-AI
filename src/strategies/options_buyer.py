@@ -28,6 +28,7 @@ from typing import Any, Optional
 import pandas as pd
 from loguru import logger
 
+from src.config.env_loader import get_config
 from src.data.features import FeatureEngine
 from src.strategies.base import BaseStrategy, Signal, SignalDirection
 
@@ -89,14 +90,19 @@ class OptionsBuyerStrategy(BaseStrategy):
     def __init__(self, config_path: str = "config/strategies.yaml"):
         super().__init__("options_buyer", config_path)
 
+        cfg = get_config()
+
         self.instruments = self.config.get("instruments", ["NIFTY", "BANKNIFTY"])
         self.strike_offset = self.config.get("strike_offset", 1)
-        self.premium_sl_pct = self.config.get("premium_sl_pct", 30) / 100
-        self.premium_tp_pct = self.config.get("premium_tp_pct", 60) / 100
-        self.max_deployable = self.config.get("max_deployable", self.MAX_DEPLOYABLE)
-        self.max_risk = self.config.get("max_risk_per_trade", self.MAX_RISK)
-        self.force_exit_time = self.config.get("force_exit_time", "15:10")
+        self.premium_sl_pct = cfg.SL_BASE_PCT / 100
+        self.premium_tp_pct = cfg.TP_BASE_PCT / 100
+        self.max_deployable = cfg.DEPLOY_CAP
+        self.max_risk = cfg.RISK_PER_TRADE
+        self.force_exit_time = cfg.TRADE_END
         self.min_confidence = self.config.get("min_confidence", 0.65)
+        self.MIN_PREMIUM = cfg.MIN_PREMIUM
+        self.MIN_WALLET_BALANCE = cfg.MIN_WALLET_BALANCE
+        self.BUFFER = cfg.BUFFER
 
         # Resolver will be injected by main.py
         self._resolver = None
@@ -136,6 +142,10 @@ class OptionsBuyerStrategy(BaseStrategy):
         self._active_trading: bool = False
         self._same_day_sl_count: int = 0  # Reset daily, halt at 2 SLs in active mode
 
+        # PLUS spread tracking (reset daily)
+        self._naked_trades_today: int = 0
+        self._spread_trades_today: int = 0
+
     def set_active_trading(self, enabled: bool) -> None:
         """Enable/disable active trading mode."""
         self._active_trading = enabled
@@ -163,6 +173,8 @@ class OptionsBuyerStrategy(BaseStrategy):
         self._full_trades_today = 0
         self._flips_today = 0
         self._same_day_sl_count = 0
+        self._naked_trades_today = 0
+        self._spread_trades_today = 0
         self._last_exit_time.clear()
         self._position_flat.clear()
 
@@ -291,8 +303,9 @@ class OptionsBuyerStrategy(BaseStrategy):
                 "VOLATILE": dt_time(13, 0),
             }
         else:
+            _nt_h, _nt_m = (int(x) for x in get_config().NO_NEW_TRADE_AFTER.split(":"))
             regime_cutoffs = {
-                "TRENDING": dt_time(14, 30),
+                "TRENDING": dt_time(_nt_h, _nt_m),
                 "RANGEBOUND": dt_time(13, 0),
                 "VOLATILE": dt_time(12, 0),
             }
@@ -707,6 +720,162 @@ class OptionsBuyerStrategy(BaseStrategy):
         )
         return qty
 
+    def _determine_trade_type(self, regime: str, score_diff: float) -> str:
+        """PLUS decision tree for trade type selection.
+
+        VOLATILE + conviction >= 2.0 → CREDIT_SPREAD
+        VOLATILE + conviction < 2.0  → SKIP
+        Any regime + conviction >= 3.0 → NAKED_BUY
+        Any regime + conviction < 3.0 → DEBIT_SPREAD
+        """
+        if regime == "VOLATILE":
+            return "CREDIT_SPREAD" if score_diff >= 2.0 else "SKIP"
+        return "NAKED_BUY" if score_diff >= 3.0 else "DEBIT_SPREAD"
+
+    def _build_spread_signal(
+        self,
+        symbol: str,
+        direction: str,
+        trade_type: str,
+        score_diff: float,
+        regime: str,
+        data: dict,
+    ) -> Optional[Signal]:
+        """Build a two-leg spread signal for PLUS mode.
+
+        For DEBIT_SPREAD: Buy ATM + Sell OTM (same option type).
+        For CREDIT_SPREAD: Sell near-OTM + Buy far-OTM protection (opposite type).
+        """
+        cfg = get_config()
+        spread_width = cfg.SPREAD_WIDTH
+        spot = data.get("close", data.get("ltp", 0))
+        if spot <= 0:
+            return None
+
+        # Get lot size from resolver
+        full_lot = 65  # NIFTY default
+        if self._resolver:
+            full_lot = self._resolver.get_lot_size(symbol) or 65
+
+        # ATM strike
+        strike_gap = 50
+        atm_strike = round(spot / strike_gap) * strike_gap
+
+        if trade_type == "DEBIT_SPREAD":
+            # Bull Call Spread (CE) or Bear Put Spread (PE)
+            leg1_strike = atm_strike
+            leg2_strike = (atm_strike + spread_width) if direction == "CE" else (atm_strike - spread_width)
+            leg1_side = "BUY"
+            leg2_side = "SELL"
+            opt_type = direction  # Same option type for both legs
+        else:  # CREDIT_SPREAD
+            # Bull Put Spread (bullish) or Bear Call Spread (bearish)
+            opt_type = "PE" if direction == "CE" else "CE"
+            if opt_type == "PE":
+                leg1_strike = atm_strike - 100  # Sell near-OTM PE
+                leg2_strike = leg1_strike - spread_width  # Buy far-OTM PE
+            else:
+                leg1_strike = atm_strike + 100  # Sell near-OTM CE
+                leg2_strike = leg1_strike + spread_width  # Buy far-OTM CE
+            leg1_side = "SELL"
+            leg2_side = "BUY"
+
+        # Resolve instruments
+        if not self._resolver:
+            logger.warning("OptionsBuyer: No resolver for spread legs")
+            return None
+
+        expiry = self._resolver.get_weekly_expiry(symbol)
+        leg1_key = self._resolver.get_instrument_key(symbol, leg1_strike, expiry, opt_type)
+        leg2_key = self._resolver.get_instrument_key(symbol, leg2_strike, expiry, opt_type)
+        if not leg1_key or not leg2_key:
+            logger.warning(f"OptionsBuyer: Cannot resolve spread legs for {symbol}")
+            return None
+
+        # Get live premiums
+        leg1_prem = 0.0
+        leg2_prem = 0.0
+        if self._data_fetcher:
+            try:
+                q1 = self._data_fetcher.get_live_quote(leg1_key)
+                q2 = self._data_fetcher.get_live_quote(leg2_key)
+                leg1_prem = q1.get("ltp", 0) if q1 else 0
+                leg2_prem = q2.get("ltp", 0) if q2 else 0
+            except Exception:
+                return None
+
+        if leg1_prem <= 0 or leg2_prem <= 0:
+            return None
+
+        # Spread economics
+        if trade_type == "DEBIT_SPREAD":
+            net_premium = leg1_prem - leg2_prem  # Net debit
+            if net_premium <= 0:
+                return None
+            max_loss_per_unit = net_premium
+            max_profit_per_unit = spread_width - net_premium
+        else:  # CREDIT_SPREAD
+            net_premium = leg1_prem - leg2_prem  # Net credit (sell - buy)
+            if net_premium <= 0:
+                return None
+            max_loss_per_unit = spread_width - net_premium
+            max_profit_per_unit = net_premium
+
+        # Lot sizing
+        if trade_type == "DEBIT_SPREAD":
+            lots_by_deploy = int(cfg.DEPLOY_CAP / (net_premium * full_lot)) if net_premium > 0 else 1
+            lots_by_risk = int(cfg.RISK_PER_TRADE / (net_premium * full_lot)) if net_premium > 0 else 1
+            lots = max(1, min(lots_by_deploy, lots_by_risk))
+        else:
+            lots_by_risk = int(cfg.RISK_PER_TRADE / (max_loss_per_unit * full_lot)) if max_loss_per_unit > 0 else 1
+            lots = max(1, lots_by_risk)
+        qty = lots * full_lot
+
+        # Risk check
+        total_max_loss = max_loss_per_unit * qty
+        if total_max_loss > cfg.RISK_PER_TRADE:
+            logger.info(f"OptionsBuyer: Spread max loss ₹{total_max_loss:.0f} > risk cap ₹{cfg.RISK_PER_TRADE:.0f}")
+            return None
+
+        signal = Signal(
+            strategy=self.name,
+            symbol=f"{symbol}{int(leg1_strike)}{opt_type}",
+            direction=SignalDirection.BUY if trade_type == "DEBIT_SPREAD" else SignalDirection.SELL,
+            confidence=min(0.55 + score_diff * 0.06, 0.95),
+            score=score_diff,
+            price=net_premium,
+            regime=regime,
+            features={
+                "is_options": True,
+                "trade_type": trade_type,
+                "is_spread": True,
+                "leg1_instrument_key": leg1_key,
+                "leg1_strike": leg1_strike,
+                "leg1_side": leg1_side,
+                "leg1_premium": leg1_prem,
+                "leg2_instrument_key": leg2_key,
+                "leg2_strike": leg2_strike,
+                "leg2_side": leg2_side,
+                "leg2_premium": leg2_prem,
+                "option_type": opt_type,
+                "spread_width": spread_width,
+                "net_premium": net_premium,
+                "max_profit": max_profit_per_unit * qty,
+                "max_loss": total_max_loss,
+                "lot_size": qty,
+                "lots": lots,
+                "index_symbol": symbol,
+            },
+        )
+
+        logger.info(
+            f"OptionsBuyer: {trade_type} signal for {symbol} | "
+            f"{leg1_side} {leg1_strike}{opt_type}@₹{leg1_prem:.0f} + "
+            f"{leg2_side} {leg2_strike}{opt_type}@₹{leg2_prem:.0f} | "
+            f"net=₹{net_premium:.0f} qty={qty} max_loss=₹{total_max_loss:.0f}"
+        )
+        return signal
+
     def _evaluate_symbol(
         self,
         symbol: str,
@@ -795,30 +964,62 @@ class OptionsBuyerStrategy(BaseStrategy):
             if is_monday:
                 mode += "_MON"
 
-            # ── Trade type: FULL or SKIP (no CAUTIOUS) ──
-            # TRENDING ≥1.75, RANGEBOUND ≥2.0, VOLATILE ≥2.5
-            if regime == "VOLATILE":
-                full_threshold = 2.5 + monday_extra + whipsaw_extra
-            elif regime == "RANGEBOUND":
-                full_threshold = 2.0 + monday_extra + whipsaw_extra
-            else:  # TRENDING
-                full_threshold = 1.75 + monday_extra + whipsaw_extra
+            # ── Trade type selection ──
+            cfg = get_config()
+            if cfg.TRADING_STAGE == "PLUS":
+                # PLUS decision tree
+                trade_type = self._determine_trade_type(regime, score_diff)
+                if trade_type == "SKIP":
+                    if symbol not in self._logged_today:
+                        logger.info(
+                            f"OptionsBuyer: VOLATILE + low conviction → SKIP {symbol} "
+                            f"(diff={score_diff:.1f})"
+                        )
+                        self._logged_today.add(symbol)
+                    return None
 
-            # Afternoon: FULL +0.5 (harder to enter)
-            if now >= dt_time(13, 0):
-                full_threshold += 0.5
+                # Per-type daily limits: max 2 naked + 2 spreads
+                if trade_type == "NAKED_BUY" and self._naked_trades_today >= 2:
+                    return None
+                if trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD") and self._spread_trades_today >= 2:
+                    return None
 
-            if score_diff >= full_threshold and direction != "":
-                trade_type = "FULL"
-            else:
-                if symbol not in self._logged_today:
-                    logger.info(
-                        f"OptionsBuyer: No conviction for {symbol} — "
-                        f"bull={bull_score:.1f} bear={bear_score:.1f} diff={score_diff:.1f} "
-                        f"(need >= {full_threshold:.1f} in {mode}) | regime={regime}"
+                # For spreads, build signal and return early
+                if trade_type in ("DEBIT_SPREAD", "CREDIT_SPREAD"):
+                    self._direction[symbol] = direction
+                    spread_signal = self._build_spread_signal(
+                        symbol, direction, trade_type, score_diff, regime, data,
                     )
-                    self._logged_today.add(symbol)
-                return None
+                    if spread_signal:
+                        self._spread_trades_today += 1
+                    return spread_signal
+
+                # NAKED_BUY falls through to existing signal construction
+            else:
+                # BASIC: original logic (unchanged)
+                # TRENDING ≥1.75, RANGEBOUND ≥2.0, VOLATILE ≥2.5
+                if regime == "VOLATILE":
+                    full_threshold = 2.5 + monday_extra + whipsaw_extra
+                elif regime == "RANGEBOUND":
+                    full_threshold = 2.0 + monday_extra + whipsaw_extra
+                else:  # TRENDING
+                    full_threshold = 1.75 + monday_extra + whipsaw_extra
+
+                # Afternoon: FULL +0.5 (harder to enter)
+                if now >= dt_time(13, 0):
+                    full_threshold += 0.5
+
+                if score_diff >= full_threshold and direction != "":
+                    trade_type = "FULL"
+                else:
+                    if symbol not in self._logged_today:
+                        logger.info(
+                            f"OptionsBuyer: No conviction for {symbol} — "
+                            f"bull={bull_score:.1f} bear={bear_score:.1f} diff={score_diff:.1f} "
+                            f"(need >= {full_threshold:.1f} in {mode}) | regime={regime}"
+                        )
+                        self._logged_today.add(symbol)
+                    return None
 
             self._direction[symbol] = direction
             # Store trade type for use later in this method
@@ -1290,6 +1491,8 @@ class OptionsBuyerStrategy(BaseStrategy):
 
         # Track trade count for daily limits
         self._full_trades_today += 1
+        if getattr(self, "_current_trade_type", "") == "NAKED_BUY":
+            self._naked_trades_today += 1
 
         # Confidence based on score_diff + triggers
         confidence = min(0.55 + score_diff * 0.06 + len(triggers) * 0.05, 0.95)

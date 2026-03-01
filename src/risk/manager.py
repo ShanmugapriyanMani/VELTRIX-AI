@@ -12,6 +12,8 @@ import pandas as pd
 import yaml
 from loguru import logger
 
+from src.config.env_loader import get_config, _env_is_set
+
 
 class RiskManager:
     """
@@ -64,6 +66,13 @@ class RiskManager:
         self.max_daily_options_loss = opts_cfg.get("max_daily_options_loss", 5000)
         self.options_min_premium = opts_cfg.get("min_premium", 50)
         self.options_max_premium = opts_cfg.get("max_premium", 500)
+
+        # EnvConfig overlay for SL/TP
+        cfg = get_config()
+        if _env_is_set("SL_BASE_PCT"):
+            self.options_sl_pct = cfg.SL_BASE_PCT / 100
+        if _env_is_set("TP_BASE_PCT"):
+            self.options_tp_pct = cfg.TP_BASE_PCT / 100
 
     def calculate_position_size(
         self,
@@ -559,4 +568,39 @@ class RiskManager:
             "stamp_duty": round(stamp, 2),
             "total_charges": round(total, 2),
             "charges_pct": round(total / turnover * 100, 4) if turnover > 0 else 0,
+        }
+
+    # ──────────────────────────────────────────
+    # PLUS Spread Risk Validation
+    # ──────────────────────────────────────────
+
+    def validate_spread_risk(
+        self,
+        trade_type: str,
+        net_premium: float,
+        spread_width: int,
+        quantity: int,
+    ) -> dict[str, Any]:
+        """Validate spread max loss against RISK_PER_TRADE.
+
+        Debit Spread: max loss = net_premium * qty (capped by spread structure).
+        Credit Spread: max loss = (spread_width - credit) * qty.
+        """
+        from src.config.env_loader import get_config
+        cfg = get_config()
+
+        if trade_type == "DEBIT_SPREAD":
+            max_loss = net_premium * quantity
+        elif trade_type == "CREDIT_SPREAD":
+            max_loss = (spread_width - net_premium) * quantity
+        else:
+            return {"passed": False, "reason": f"Unknown spread type: {trade_type}"}
+
+        passed = max_loss <= cfg.RISK_PER_TRADE
+        return {
+            "passed": passed,
+            "trade_type": trade_type,
+            "max_loss": round(max_loss, 2),
+            "risk_cap": cfg.RISK_PER_TRADE,
+            "reason": "" if passed else f"Max loss ₹{max_loss:.0f} > risk cap ₹{cfg.RISK_PER_TRADE:.0f}",
         }

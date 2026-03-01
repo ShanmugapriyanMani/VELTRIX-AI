@@ -20,10 +20,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
+import copy
+
 import numpy as np
 import pandas as pd
 import yaml
 from loguru import logger
+
+from src.config.env_loader import get_config, _env_is_set
 
 
 class MarketRegime(str, Enum):
@@ -169,6 +173,18 @@ class RegimeDetector:
 
         self.cooldown_minutes = regime_cfg.get("regime_change_cooldown_minutes", 60)
 
+        # Instance-level copy so class constant is never mutated
+        self._profiles = copy.deepcopy(self.REGIME_PROFILES)
+
+        # Override conviction thresholds from env if explicitly set
+        cfg = get_config()
+        if _env_is_set("TRENDING_THRESHOLD"):
+            self._profiles[MarketRegime.TRENDING]["conviction_min"] = cfg.TRENDING_THRESHOLD
+        if _env_is_set("RANGEBOUND_THRESHOLD"):
+            self._profiles[MarketRegime.RANGEBOUND]["conviction_min"] = cfg.RANGEBOUND_THRESHOLD
+        if _env_is_set("VOLATILE_THRESHOLD"):
+            self._profiles[MarketRegime.VOLATILE]["conviction_min"] = cfg.VOLATILE_THRESHOLD
+
         self._last_regime: Optional[RegimeState] = None
         self._last_change_time: Optional[datetime] = None
 
@@ -269,7 +285,7 @@ class RegimeDetector:
 
         # ── Build result with behavior profile ──
         active_strategies = list(self.REGIME_STRATEGIES.get(regime, []))
-        profile = self.REGIME_PROFILES.get(regime, self.REGIME_PROFILES[MarketRegime.TRENDING])
+        profile = self._profiles.get(regime, self._profiles[MarketRegime.TRENDING])
 
         state = RegimeState(
             regime=regime,
@@ -442,7 +458,7 @@ class RegimeDetector:
             if self._last_regime:
                 return self._last_regime.size_multiplier
             return 1.0
-        profile = self.REGIME_PROFILES.get(regime, {})
+        profile = self._profiles.get(regime, {})
         return profile.get("size_multiplier", 1.0)
 
     @property

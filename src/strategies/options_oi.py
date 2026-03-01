@@ -88,6 +88,7 @@ class OptionsOIStrategy(BaseStrategy):
         support = oi_levels.get("max_put_oi_strike", 0)
         call_oi_change = oi_levels.get("max_call_oi_change", 0)
         max_call_oi = oi_levels.get("max_call_oi", 1)
+        max_put_oi = oi_levels.get("max_put_oi", 1)
         pcr_oi = pcr.get("pcr_oi", 1.0)
 
         if resistance <= 0 or support <= 0:
@@ -101,7 +102,7 @@ class OptionsOIStrategy(BaseStrategy):
         # ── Analysis 1: Breakout Detection ──
         breakout_signal = self._check_breakout(
             nifty_price, resistance, support,
-            call_oi_change, max_call_oi,
+            call_oi_change, max_call_oi, max_put_oi,
             dist_to_resistance, dist_to_support, pcr_oi,
         )
 
@@ -166,6 +167,7 @@ class OptionsOIStrategy(BaseStrategy):
         support: float,
         call_oi_change: int,
         max_call_oi: int,
+        max_put_oi: int,
         dist_to_resistance: float,
         dist_to_support: float,
         pcr_oi: float,

@@ -10,9 +10,9 @@ import uuid
 from datetime import datetime, time as dt_time
 from typing import Any, Optional
 
-import yaml
 from loguru import logger
 
+from src.config.env_loader import get_config
 from src.execution.broker import BaseBroker
 from src.risk.manager import RiskManager
 from src.risk.circuit_breaker import CircuitBreaker
@@ -39,11 +39,7 @@ class OrderManager:
         self.risk_manager = risk_manager
         self.circuit_breaker = circuit_breaker
 
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-
-        trading_cfg = config.get("trading", {})
-        self.square_off_time = trading_cfg.get("square_off_time", "15:15")
+        self.square_off_time = get_config().SQUARE_OFF_TIME
         self.product = "I"  # Default intraday
 
         # Active orders tracking
@@ -95,6 +91,8 @@ class OrderManager:
         is_options = features.get("is_options", False) or instrument_key.startswith("NSE_FO|")
 
         if is_options:
+            if features.get("is_spread", False):
+                return self._execute_spread_signal(signal, capital, current_positions)
             return self._execute_options_signal(signal, capital, current_positions)
 
         # ── Equity position sizing ──
@@ -519,6 +517,190 @@ class OrderManager:
                         reconciled += 1
 
         return {"reconciled": reconciled, "pending": len(self._pending_orders)}
+
+    # ──────────────────────────────────────────
+    # PLUS Spread Execution
+    # ──────────────────────────────────────────
+
+    def _execute_spread_signal(
+        self,
+        signal: dict[str, Any],
+        capital: float,
+        current_positions: Any,
+    ) -> dict[str, Any]:
+        """Execute a two-leg spread order with atomic rollback on failure."""
+        features = signal.get("features", {})
+        trade_type = features.get("trade_type", "")
+        qty = features.get("lot_size", 0)
+
+        # Place leg 1
+        leg1_result = self.broker.place_order(
+            symbol=signal.get("symbol", ""),
+            instrument_key=features["leg1_instrument_key"],
+            quantity=qty,
+            side=features["leg1_side"],
+            order_type="MARKET",
+            price=features["leg1_premium"],
+            product="I",
+        )
+        if leg1_result.get("status") != "success":
+            return {"status": "error", "reason": "Leg 1 failed", "detail": leg1_result}
+
+        # Place leg 2
+        idx = features.get("index_symbol", "")
+        leg2_sym = f"{idx}{int(features['leg2_strike'])}{features['option_type']}"
+        leg2_result = self.broker.place_order(
+            symbol=leg2_sym,
+            instrument_key=features["leg2_instrument_key"],
+            quantity=qty,
+            side=features["leg2_side"],
+            order_type="MARKET",
+            price=features["leg2_premium"],
+            product="I",
+        )
+        if leg2_result.get("status") != "success":
+            # CRITICAL: Unwind leg 1 immediately
+            logger.critical(f"SPREAD LEG 2 FAILED — unwinding leg 1")
+            unwind_side = "SELL" if features["leg1_side"] == "BUY" else "BUY"
+            self.broker.place_order(
+                symbol=signal.get("symbol", ""),
+                instrument_key=features["leg1_instrument_key"],
+                quantity=qty,
+                side=unwind_side,
+                order_type="MARKET",
+                price=features["leg1_premium"],
+                product="I",
+            )
+            return {"status": "error", "reason": "Leg 2 failed, leg 1 unwound"}
+
+        # Track spread as a single unit
+        trade_id = str(uuid.uuid4())[:8]
+        trade_record = {
+            "trade_id": trade_id,
+            "order_id_leg1": leg1_result.get("order_id", ""),
+            "order_id_leg2": leg2_result.get("order_id", ""),
+            "symbol": signal.get("symbol", ""),
+            "leg2_symbol": leg2_sym,
+            "trade_type": trade_type,
+            "is_spread": True,
+            "is_options": True,
+            "leg1_instrument_key": features["leg1_instrument_key"],
+            "leg1_side": features["leg1_side"],
+            "leg1_premium": features["leg1_premium"],
+            "leg2_instrument_key": features["leg2_instrument_key"],
+            "leg2_side": features["leg2_side"],
+            "leg2_premium": features["leg2_premium"],
+            "quantity": qty,
+            "net_premium": features.get("net_premium", 0),
+            "max_profit": features.get("max_profit", 0),
+            "max_loss": features.get("max_loss", 0),
+            "spread_width": features.get("spread_width", 0),
+            "strategy": signal.get("strategy", "options_buyer"),
+            "regime": signal.get("regime", ""),
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._pending_orders[trade_id] = trade_record
+
+        logger.info(
+            f"SPREAD EXECUTED: {trade_type} | "
+            f"{features['leg1_side']} {features['leg1_strike']}@₹{features['leg1_premium']:.0f} + "
+            f"{features['leg2_side']} {features['leg2_strike']}@₹{features['leg2_premium']:.0f} | "
+            f"net=₹{features.get('net_premium', 0):.0f} qty={qty} | id={trade_id}"
+        )
+        return {"status": "success", **trade_record}
+
+    def check_spread_exits(self) -> list[dict[str, Any]]:
+        """Monitor open spreads for SL/TP exit conditions.
+
+        Both legs ALWAYS exit together.
+        """
+        exits = []
+        cfg = get_config()
+
+        for trade_id, trade in list(self._pending_orders.items()):
+            if not trade.get("is_spread"):
+                continue
+
+            trade_type = trade.get("trade_type", "")
+            qty = trade.get("quantity", 0)
+            entry_net = trade.get("net_premium", 0)
+
+            # Get current premiums
+            try:
+                ltp1 = self.broker.get_ltp(trade["leg1_instrument_key"]).get("ltp", 0)
+                ltp2 = self.broker.get_ltp(trade["leg2_instrument_key"]).get("ltp", 0)
+            except Exception:
+                continue
+            if ltp1 <= 0 or ltp2 <= 0:
+                continue
+
+            should_exit = False
+            exit_reason = ""
+            spread_pnl = 0.0
+
+            if trade_type == "DEBIT_SPREAD":
+                # BUY leg 1, SELL leg 2 — spread value = ltp1 - ltp2
+                current_net = ltp1 - ltp2
+                spread_pnl = (current_net - entry_net) * qty
+                sl_threshold = -entry_net * (cfg.DEBIT_SPREAD_SL_PCT / 100) * qty
+                tp_threshold = trade["max_profit"] * (cfg.DEBIT_SPREAD_TP_PCT / 100)
+                if spread_pnl <= sl_threshold:
+                    should_exit, exit_reason = True, "spread_sl"
+                elif spread_pnl >= tp_threshold:
+                    should_exit, exit_reason = True, "spread_tp"
+
+            elif trade_type == "CREDIT_SPREAD":
+                # SELL leg 1, BUY leg 2 — P&L = credit - cost_to_close
+                close_cost = ltp1 - ltp2  # Cost to buy back sell leg
+                spread_pnl = (entry_net - close_cost) * qty
+                sl_threshold = -entry_net * cfg.CREDIT_SPREAD_SL_MULTIPLIER * qty
+                tp_threshold = entry_net * (cfg.CREDIT_SPREAD_TP_PCT / 100) * qty
+                if spread_pnl <= sl_threshold:
+                    should_exit, exit_reason = True, "spread_sl"
+                elif spread_pnl >= tp_threshold:
+                    should_exit, exit_reason = True, "spread_tp"
+
+            if should_exit:
+                self._exit_spread(trade_id, trade, exit_reason, ltp1, ltp2)
+                exits.append({
+                    "trade_id": trade_id,
+                    "trade_type": trade_type,
+                    "exit_reason": exit_reason,
+                    "pnl": spread_pnl,
+                })
+
+        return exits
+
+    def _exit_spread(
+        self, trade_id: str, trade: dict, reason: str, ltp1: float, ltp2: float,
+    ) -> None:
+        """Close both legs of a spread position atomically."""
+        # Unwind leg 1
+        unwind1 = "SELL" if trade["leg1_side"] == "BUY" else "BUY"
+        self.broker.place_order(
+            symbol=trade["symbol"],
+            instrument_key=trade["leg1_instrument_key"],
+            quantity=trade["quantity"],
+            side=unwind1,
+            order_type="MARKET",
+            price=ltp1,
+            product="I",
+        )
+        # Unwind leg 2
+        unwind2 = "SELL" if trade["leg2_side"] == "BUY" else "BUY"
+        self.broker.place_order(
+            symbol=trade.get("leg2_symbol", trade["symbol"]),
+            instrument_key=trade["leg2_instrument_key"],
+            quantity=trade["quantity"],
+            side=unwind2,
+            order_type="MARKET",
+            price=ltp2,
+            product="I",
+        )
+
+        if trade_id in self._pending_orders:
+            del self._pending_orders[trade_id]
+        logger.info(f"SPREAD EXIT: {trade['trade_type']} {reason} | id={trade_id}")
 
     @property
     def pending_count(self) -> int:

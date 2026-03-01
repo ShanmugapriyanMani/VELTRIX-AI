@@ -20,7 +20,8 @@ class TestRiskManager:
             win_rate=0.55,
         )
         assert result["quantity"] > 0
-        assert result["value"] <= 25000 * 0.04  # Max 4% per trade = ₹1,000
+        # Max 40% per trade (from config), capped by min_position_value/max_position_value
+        assert result["value"] <= 25000 * 0.40
 
     def test_position_sizing_zero_price(self):
         result = self.rm.calculate_position_size(
@@ -31,28 +32,31 @@ class TestRiskManager:
     def test_position_sizing_exposure_limit(self):
         result = self.rm.calculate_position_size(
             capital=25000, price=500, confidence=0.7, atr=10,
-            current_exposure=19500,  # Near 80% limit (₹20,000)
+            current_exposure=21500,  # Near 90% limit (₹22,500)
         )
-        # Deployable = min(80%, 80%) of 25K = 20K, remaining = 500
-        assert result["value"] <= 25000 * 0.80 - 19500 + 100
+        # Deployable = min(90%, 90%) of 25K = 22500, remaining = 1000
+        # Result should be capped by remaining exposure
+        assert result["value"] <= 25000 * 0.90 - 21500 + 100
 
     def test_position_sizing_cash_reserve(self):
-        """20% cash reserve means max deployable is 80% of capital."""
+        """10% cash reserve means max deployable is 90% of capital."""
         result = self.rm.calculate_position_size(
             capital=25000, price=500, confidence=0.9, atr=10,
-            current_exposure=19000,
+            current_exposure=21500,
         )
-        # With 20% cash reserve: deployable = 25000 * 0.80 = 20000
-        # remaining = 20000 - 19000 = 1000
+        # With 10% cash reserve: deployable = 25000 * 0.90 = 22500
+        # remaining = 22500 - 21500 = 1000
         assert result["value"] <= 1000 + 1
 
     def test_stop_loss_calculation(self):
         stops = self.rm.calculate_stops(
             entry_price=2500, atr=50, direction="BUY"
         )
-        assert stops["stop_loss"] == 2500 - 2.0 * 50  # 2400
-        assert stops["take_profit"] == 2500 + 4.0 * 50  # 2700
-        assert stops["reward_risk_ratio"] == 2.0
+        # Config: sl_atr_mult=1.5, tp_atr_mult=2.0
+        assert stops["stop_loss"] == 2500 - 1.5 * 50  # 2425
+        assert stops["take_profit"] == 2500 + 2.0 * 50  # 2600
+        # risk = 75, reward = 100, ratio = 1.33
+        assert stops["reward_risk_ratio"] == round(100 / 75, 2)
 
     def test_trade_cost_calculation(self):
         costs = self.rm.calculate_trade_costs(
@@ -68,8 +72,8 @@ class TestRiskManager:
     def test_pre_trade_check_passes(self):
         result = self.rm.pre_trade_check(
             symbol="RELIANCE",
-            price=500,
-            quantity=2,  # ₹1,000 < 8% of ₹25K (₹2,000)
+            price=2500,
+            quantity=4,  # ₹10,000 > min_position_value (₹5,000) and < 50% of ₹25K
             direction="BUY",
             capital=25000,
             current_positions=pd.DataFrame(),
@@ -81,7 +85,7 @@ class TestRiskManager:
         result = self.rm.pre_trade_check(
             symbol="RELIANCE",
             price=2500,
-            quantity=10,  # ₹25,000 > 8% of ₹25K (₹2,000)
+            quantity=10,  # ₹25,000 > 50% of ₹25K (₹12,500)
             direction="BUY",
             capital=25000,
             current_positions=pd.DataFrame(),
@@ -165,22 +169,27 @@ class TestCircuitBreaker:
         assert self.cb.can_trade()
 
     def test_daily_loss_warning(self):
-        """3% daily loss → WARNING (reduce sizes 50%)."""
-        status = self.cb.check(daily_loss_pct=3.5, drawdown_pct=5.0, open_positions=3)
+        """10% daily loss → WARNING. V2.2: conviction boost, NOT size reduction."""
+        status = self.cb.check(daily_loss_pct=12.0, drawdown_pct=5.0, open_positions=3)
         assert status.state == BreakerState.WARNING
-        assert self.cb.get_size_multiplier() == 0.5
+        # V2.2: WARNING uses conviction boost instead of size multiplier
+        assert self.cb.get_conviction_boost() == 1.0
+        # Size multiplier stays at 1.0 in WARNING (no longer 0.5)
+        assert self.cb.get_size_multiplier() == 1.0
 
     def test_daily_loss_halt(self):
-        """5% daily loss → HALT trading."""
-        status = self.cb.check(daily_loss_pct=6.0, drawdown_pct=5.0, open_positions=3)
+        """20% daily loss → HALT trading."""
+        status = self.cb.check(daily_loss_pct=22.0, drawdown_pct=5.0, open_positions=3)
         assert status.state == BreakerState.HALTED
         assert not self.cb.can_trade()
 
     def test_drawdown_warning(self):
-        """15% drawdown → WARNING (reduce sizes 50%)."""
+        """15% drawdown → WARNING. V2.2: conviction boost, NOT size reduction."""
         status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=16.0, open_positions=3)
         assert status.state == BreakerState.WARNING
-        assert self.cb.get_size_multiplier() == 0.5
+        # V2.2: WARNING uses conviction boost instead of size multiplier
+        assert self.cb.get_conviction_boost() == 1.0
+        assert self.cb.get_size_multiplier() == 1.0
 
     def test_drawdown_critical_halt(self):
         """22% drawdown → HALT."""
@@ -188,16 +197,16 @@ class TestCircuitBreaker:
         assert status.state == BreakerState.HALTED
 
     def test_consecutive_losses_pause(self):
-        """6 consecutive losses → PAUSE 1 hour."""
-        for _ in range(6):
+        """4 consecutive losses → PAUSE 1 hour (config: pause_threshold=4)."""
+        for _ in range(4):
             self.cb.record_trade(-100)
 
         status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
         assert status.state == BreakerState.PAUSED
 
     def test_consecutive_losses_halt(self):
-        """10 consecutive losses → HALT."""
-        for _ in range(10):
+        """7 consecutive losses → HALT (config: halt_threshold=7)."""
+        for _ in range(7):
             self.cb.record_trade(-100)
 
         status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
@@ -217,7 +226,7 @@ class TestCircuitBreaker:
         assert not self.cb.can_trade()
 
     def test_daily_reset(self):
-        self.cb.check(daily_loss_pct=6.0, drawdown_pct=5.0, open_positions=0)
+        self.cb.check(daily_loss_pct=22.0, drawdown_pct=5.0, open_positions=0)
         assert not self.cb.can_trade()
 
         self.cb.reset_daily()

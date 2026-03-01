@@ -132,17 +132,17 @@ class TestOrderManager:
             "instrument_key": "NSE_EQ|INE154A01025",
             "direction": "BUY",
             "price": 450,
-            "confidence": 0.7,
+            "confidence": 0.8,
             "stop_loss": 430,
             "take_profit": 490,
             "strategy": "test",
-            "regime": "BULL_TRENDING",
+            "regime": "TRENDING",
             "size_multiplier": 1.0,
             "atr": 10,
             "sector": "FMCG",
         }
 
-        result = self.om.execute_signal(signal, 25000, pd.DataFrame())
+        result = self.om.execute_signal(signal, 50000, pd.DataFrame())
         assert result["status"] == "success"
         assert result["quantity"] > 0
 

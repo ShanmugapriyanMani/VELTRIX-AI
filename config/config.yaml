@@ -1,5 +1,7 @@
 # ═══════════════════════════════════════════
 # MAIN CONFIGURATION — Indian AI Trading Bot
+# NOTE: Capital, risk, timing settings can be overridden via .env
+# This file contains Upstox config, universe, and database settings
 # ═══════════════════════════════════════════
 
 upstox:
