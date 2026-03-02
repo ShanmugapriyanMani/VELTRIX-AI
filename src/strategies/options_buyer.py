@@ -146,6 +146,13 @@ class OptionsBuyerStrategy(BaseStrategy):
         self._naked_trades_today: int = 0
         self._spread_trades_today: int = 0
 
+        # Confirmation timeout: unlock stuck direction after 30 min of failed confirmations
+        self._confirm_fail_since: dict[str, datetime] = {}  # {symbol: first_fail_time}
+        self._direction_rescores_today: int = 0  # Max 3 re-scores per day
+
+        # SL direction unlock: track per-direction SL count today
+        self._sl_count_by_direction_today: dict[str, int] = {}  # {"CE": N, "PE": N}
+
     def set_active_trading(self, enabled: bool) -> None:
         """Enable/disable active trading mode."""
         self._active_trading = enabled
@@ -177,6 +184,9 @@ class OptionsBuyerStrategy(BaseStrategy):
         self._spread_trades_today = 0
         self._last_exit_time.clear()
         self._position_flat.clear()
+        self._confirm_fail_since.clear()
+        self._direction_rescores_today = 0
+        self._sl_count_by_direction_today.clear()
 
     def record_exit(self, symbol: str, exit_reason: str, direction: str) -> None:
         """Record a trade exit for consecutive SL and streak tracking.
@@ -231,11 +241,33 @@ class OptionsBuyerStrategy(BaseStrategy):
 
         if exit_reason == "stop_loss":
             self._same_day_sl_count += 1
+            # Track per-direction SL count today
+            self._sl_count_by_direction_today[direction] = (
+                self._sl_count_by_direction_today.get(direction, 0) + 1
+            )
             if direction == self._consec_sl_direction:
                 self._consec_sl_count += 1
             else:
                 self._consec_sl_direction = direction
                 self._consec_sl_count = 1
+
+            # 2 SLs same direction today → unlock direction for re-score
+            # (works regardless of ACTIVE_TRADING setting)
+            if self._sl_count_by_direction_today[direction] >= 2:
+                trades = self._trades_today.get(index_sym, 1)
+                if trades < max_trades_per_symbol and self._direction_rescores_today < 3:
+                    self._traded_today.discard(index_sym)
+                    self._direction.pop(index_sym, None)
+                    self._direction_scores.pop(index_sym, None)
+                    self._logged_today.discard(index_sym)
+                    self._confirm_fail_since.pop(index_sym, None)
+                    self._direction_rescores_today += 1
+                    logger.info(
+                        f"OptionsBuyer: 2 SLs in {direction} today — "
+                        f"unlocking {index_sym} for direction re-score "
+                        f"(rescore #{self._direction_rescores_today}/3)"
+                    )
+
             # Streak: decrement on loss
             self._streak = min(self._streak - 1, -1)
             self._recent_outcomes.append(False)
@@ -1127,6 +1159,33 @@ class OptionsBuyerStrategy(BaseStrategy):
             min_triggers = 2  # Morning: standard
 
         if len(triggers) < min_triggers:
+            # ── Confirmation timeout: unlock stuck direction after 30 min ──
+            # Only when NO trade placed yet for this symbol
+            now_dt = datetime.now()
+            if symbol not in self._traded_today and self._trades_today.get(symbol, 0) == 0:
+                if symbol not in self._confirm_fail_since:
+                    self._confirm_fail_since[symbol] = now_dt
+                elif (now_dt - self._confirm_fail_since[symbol]).total_seconds() >= 1800:
+                    # 30 minutes of failed confirmations — re-score direction
+                    if self._direction_rescores_today < 3:
+                        old_dir = direction
+                        self._direction.pop(symbol, None)
+                        self._direction_scores.pop(symbol, None)
+                        self._confirm_fail_since.pop(symbol, None)
+                        self._direction_rescores_today += 1
+                        # Clear skip logs so new direction logs fresh
+                        self._logged_today = {
+                            k for k in self._logged_today
+                            if not k.startswith(f"SKIP_{symbol}")
+                        }
+                        self._logged_today.discard(symbol)
+                        logger.info(
+                            f"DIRECTION TIMEOUT: {symbol} {old_dir} — "
+                            f"confirmations failed for 30 min, re-scoring "
+                            f"(rescore #{self._direction_rescores_today}/3)"
+                        )
+                        return None  # Next loop will re-compute direction
+
             # Log skipped signals every ~5 minutes (not every 30s)
             skip_key = f"SKIP_{symbol}_{now.minute // 5}"
             if skip_key not in self._logged_today:
@@ -1139,6 +1198,9 @@ class OptionsBuyerStrategy(BaseStrategy):
                 )
                 self._logged_today.add(skip_key)
             return None
+
+        # Confirmations passed — clear timeout tracker
+        self._confirm_fail_since.pop(symbol, None)
 
         bias = "BULLISH" if direction == "CE" else "BEARISH"
 

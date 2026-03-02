@@ -72,7 +72,7 @@ from src.execution.upstox_broker import UpstoxBroker
 from src.execution.paper_trader import PaperTrader
 from src.execution.order_manager import OrderManager
 from src.dashboard.alerts import TelegramAlerts
-from src.utils.market_calendar import is_expiry_day, is_expiry_week
+from src.utils.market_calendar import is_expiry_day, is_expiry_week, load_holidays
 
 
 class TradingBot:
@@ -96,6 +96,7 @@ class TradingBot:
             self.config = yaml.safe_load(f)
 
         cfg = get_config()
+        cfg.TRADING_MODE = mode  # Override env default with CLI --mode
         capital = cfg.TRADING_CAPITAL
 
         # ── Initialize components ──
@@ -185,6 +186,20 @@ class TradingBot:
                 return
             # "wait" and "trade" both proceed — existing _wait_until() calls handle timing
 
+        # ── Token check: verify Upstox token is valid ──
+        token = self.data_fetcher.auth.load_token()
+        if not token:
+            logger.critical(
+                "UPSTOX TOKEN EXPIRED or missing — run: python scripts/auth_upstox.py"
+            )
+            if self.mode == "live":
+                logger.critical("Cannot run LIVE mode without valid token. Aborting.")
+                return
+            logger.warning("Paper mode continuing — live quotes may fail, using cached data")
+
+        # ── Load NSE holidays (Upstox API → cache → fallback) ──
+        load_holidays(access_token=token)
+
         try:
             # ── Phase 0: Auto-fetch all data (incremental — fast when up to date) ──
             logger.info("=== AUTO-FETCH: Updating all data sources ===")
@@ -204,7 +219,7 @@ class TradingBot:
             # ── Send bot started alert ──
             self.alerts.alert_bot_started(
                 mode=self.mode,
-                capital=self.config["trading"]["capital"],
+                capital=cfg.TRADING_CAPITAL,
                 ml_prediction={
                     "prob_up": self._options_ml_prob_up,
                     "prob_down": self._options_ml_prob_down,
@@ -217,13 +232,29 @@ class TradingBot:
             # ── Phase 2: Connect to broker (9:00 AM) ──
             self._connect_broker()
 
+            # ── Send live capital update to Telegram (after broker sets real funds) ──
+            if self.mode == "live" and self._running:
+                cfg = get_config()
+                self.alerts._send_message(
+                    f"💰 <b>Live Capital (Upstox)</b>\n"
+                    f"Capital: ₹{cfg.TRADING_CAPITAL:,.0f}\n"
+                    f"Deployable: ₹{cfg.DEPLOY_CAP:,.0f}\n"
+                    f"Risk/Trade: ₹{cfg.RISK_PER_TRADE:,.0f}"
+                )
+
             # ── Phase 3: Market hours trading loop ──
             self._trading_loop()
 
-            # ── Phase 4: Post-market (save EOD data) ──
+            # ── Phase 4: Post-market (save portfolio snapshot) ──
             self._post_market()
 
-            # ── Phase 5: Save EOD candle data for future backtests ──
+            # ── Phase 5: Wait for market close (3:30 PM) then save full-day candles ──
+            market_close = dt_time(15, 30)
+            if datetime.now().time() < market_close:
+                logger.info(
+                    f"Market still open until 15:30 — waiting to save complete EOD data..."
+                )
+                self._wait_until(market_close)
             self._save_eod_candle_data()
 
         except Exception as e:
@@ -329,18 +360,47 @@ class TradingBot:
                 return
             logger.warning("Broker connection failed (paper mode continues)")
 
-        # ── Capital verification (live mode only) ──
+        # ── Capital & profile verification (live mode only) ──
         if self.mode == "live" and self._running:
             cfg = get_config()
             try:
+                # Fetch user profile
+                profile = self.broker.get_profile()
+                if profile:
+                    logger.info(
+                        f"Upstox Account: {profile.get('user_name', '?')} "
+                        f"({profile.get('user_id', '?')}) | "
+                        f"Active: {profile.get('is_active', '?')}"
+                    )
+
+                # Fetch live funds from Upstox
                 funds = self.broker.get_funds()
                 available = float(funds.get("available_margin", 0))
                 used = float(funds.get("used_margin", 0))
-                total = available + used
+                total = float(funds.get("total_balance", 0)) or (available + used)
 
-                logger.info(f"Account funds: Available ₹{available:,.2f} | Used ₹{used:,.2f} | Total ₹{total:,.2f}")
-                logger.info(f"Config requires: Capital ₹{cfg.TRADING_CAPITAL:,.0f} | Deploy Cap ₹{cfg.DEPLOY_CAP:,.0f} | Min Wallet ₹{cfg.MIN_WALLET_BALANCE:,.0f}")
+                logger.info(
+                    f"Upstox Funds: Available ₹{available:,.2f} | "
+                    f"Used ₹{used:,.2f} | Total ₹{total:,.2f}"
+                )
 
+                # ── Verify funds & cap deploy at available margin ──
+                if total > 0:
+                    # Capital stays from .env (user's intended allocation)
+                    # Deploy cap = min(available margin, configured cap)
+                    old_deploy = cfg.DEPLOY_CAP
+                    cfg.DEPLOY_CAP = min(available, cfg.DEPLOY_CAP) if cfg.DEPLOY_CAP > 0 else available
+
+                    # Update options buyer to use live deploy cap
+                    self.options_buyer.max_deployable = cfg.DEPLOY_CAP
+
+                    logger.info(
+                        f"Capital: ₹{cfg.TRADING_CAPITAL:,.0f} (config) | "
+                        f"Upstox Available: ₹{available:,.0f} | "
+                        f"Deploy Cap: ₹{old_deploy:,.0f} → ₹{cfg.DEPLOY_CAP:,.0f}"
+                    )
+
+                # ── Insufficient funds check ──
                 if available < cfg.MIN_WALLET_BALANCE:
                     logger.critical(
                         f"INSUFFICIENT FUNDS: ₹{available:,.2f} available < "
@@ -355,7 +415,7 @@ class TradingBot:
                         f"₹{cfg.DEPLOY_CAP:,.0f} deploy cap. Trades may be limited."
                     )
             except Exception as e:
-                logger.warning(f"Could not verify account funds: {e}")
+                logger.warning(f"Could not verify account funds: {e} — using config values")
 
     def _trading_loop(self) -> None:
         """Main trading loop during market hours."""
@@ -712,8 +772,11 @@ class TradingBot:
                 logger.error(f"Trading loop error (iter {iteration}): {e}")
 
             # Sleep between iterations — interruptible for graceful shutdown
+            # No position: 30s scan | Position open: 15s scan (live only)
             if self.data_fetcher.is_network_down:
                 sleep_secs = 60
+            elif self.mode == "live" and len(self.portfolio.positions) > 0:
+                sleep_secs = 15
             else:
                 sleep_secs = 30
             # Sleep in 5s chunks so Ctrl+C / _running=False is responsive
@@ -908,13 +971,13 @@ class TradingBot:
 
     def _train_options_direction_ml(self) -> None:
         """
-        Train options direction ML model with 10-day retrain interval.
+        Train options direction ML model — weekly Monday retrain.
 
         Same walk-forward LightGBM binary classifier as backtest Factor 7:
         - 19 technical features from NIFTY daily candles (16 base + 3 momentum/range)
         - Binary target: next-day up (1) or down (0)
         - 90-day training window (matches backtest for stability)
-        - Retrain every 10 days (matches backtest), load cached model otherwise
+        - Retrain every Monday, use cached model Tue-Fri
         - Always predicts today's direction using latest features
         """
         try:
@@ -929,20 +992,29 @@ class TradingBot:
         model_path = Path("models/options_direction_model.pkl")
         scaler_path = Path("models/options_direction_scaler.pkl")
 
-        # Check if saved model is fresh enough (< 10 days old)
-        retrain_interval_days = 10
-        need_retrain = True
+        # Weekly retrain: Monday only, use cached model Tue-Fri
+        is_monday = datetime.now().weekday() == 0
+        need_retrain = is_monday  # Always retrain on Monday
+        model_age_days = 0
+
         if model_path.exists() and scaler_path.exists():
             model_age_days = (date.today() - date.fromtimestamp(model_path.stat().st_mtime)).days
-            if model_age_days < retrain_interval_days:
+            if not is_monday:
                 need_retrain = False
+                days_to_monday = (7 - datetime.now().weekday()) % 7 or 7
                 logger.info(
-                    f"=== OPTIONS ML: Using cached model "
-                    f"(age={model_age_days}d, retrain in {retrain_interval_days - model_age_days}d) ==="
+                    f"=== OPTIONS ML: Using Monday's model "
+                    f"(age={model_age_days}d, next retrain: Monday in {days_to_monday}d) ==="
                 )
+        else:
+            # No model exists — must train regardless of day
+            need_retrain = True
 
         if need_retrain:
-            logger.info("=== OPTIONS DIRECTION ML TRAINING ===")
+            logger.info(
+                f"=== OPTIONS DIRECTION ML TRAINING "
+                f"{'(Monday weekly refresh)' if is_monday else '(no cached model)'} ==="
+            )
 
         try:
             # Fetch last 300 days of NIFTY daily candles from DB
@@ -1036,7 +1108,7 @@ class TradingBot:
                     nifty_df[col] = nifty_df[col].fillna(0.0)
 
             if need_retrain:
-                # ── Retrain model (every 10 days) ──
+                # ── Retrain model (weekly Monday) ──
                 # Intraday target: close > open = bullish, exclude ±0.2% noise
                 nifty_df["_intraday_ret"] = (nifty_df["close"] - nifty_df["open"]) / nifty_df["open"]
                 nifty_df["_ml_target"] = pd.NA
@@ -1720,11 +1792,259 @@ class TradingBot:
     # ─────────────────────────────────────────
 
     def _run_backtest(self) -> None:
-        """Run backtest mode — Options only (CE/PE on NIFTY)."""
-        logger.info("=== BACKTEST MODE (Options Only) ===")
+        """Run backtest mode — paper report (default) or full historical (--full)."""
+        if getattr(self, "_full_backtest", False):
+            logger.info("=== FULL HISTORICAL BACKTEST ===")
+            capital = getattr(self, "_backtest_capital", None) or get_config().TRADING_CAPITAL
+            self._run_options_backtest(capital)
+        else:
+            self._run_paper_report()
 
-        capital = getattr(self, "_backtest_capital", None) or self.config["trading"]["capital"]
-        self._run_options_backtest(capital)
+    def _run_paper_report(self) -> None:
+        """
+        Paper trading performance report — reads trades and portfolio snapshots from DB.
+        Shows daily P&L, trade details, monthly returns, win rate, and risk metrics.
+        """
+        import pandas as pd
+        from collections import defaultdict
+
+        cfg = get_config()
+
+        logger.info("")
+        logger.info("=" * 65)
+        logger.info("  VELTRIX — PAPER TRADING REPORT")
+        logger.info("=" * 65)
+
+        # ── Load data from DB ──
+        trades_df = self.store.get_trades(strategy="options_buyer", limit=10000)
+        portfolio_df = self.store.get_portfolio_history(days=365)
+
+        # Filter trades that have PnL (completed trades)
+        if trades_df.empty:
+            logger.warning("No paper trades found in database.")
+            logger.info("Run paper trading first: python src/main.py --mode paper")
+            return
+
+        # Completed trades have entry_time and pnl
+        completed = trades_df[
+            (trades_df["entry_time"].notna()) & (trades_df["entry_time"] != "")
+            & (trades_df["pnl"].notna()) & (trades_df["pnl"] != 0)
+        ].copy()
+
+        if completed.empty:
+            logger.warning("No completed trades with P&L found.")
+            logger.info("Run paper trading first: python src/main.py --mode paper")
+            return
+
+        completed["entry_time"] = pd.to_datetime(completed["entry_time"])
+        completed["exit_time"] = pd.to_datetime(completed["exit_time"])
+        completed["trade_date"] = completed["entry_time"].dt.date
+        completed["pnl"] = completed["pnl"].astype(float)
+        completed["quantity"] = completed["quantity"].astype(int)
+        completed["price"] = completed["price"].astype(float)
+
+        # ── Helper for table printing ──
+        def print_table(title, headers, rows, col_widths=None):
+            if not col_widths:
+                col_widths = []
+                for ci in range(len(headers)):
+                    max_w = len(headers[ci])
+                    for row in rows:
+                        if ci < len(row):
+                            max_w = max(max_w, len(str(row[ci])))
+                    col_widths.append(max_w + 2)
+
+            total_w = sum(col_widths) + len(col_widths) + 1
+            logger.info("")
+            logger.info(f"  {title}")
+            logger.info("  " + "─" * (total_w - 2))
+
+            header_str = "│"
+            for h, w in zip(headers, col_widths):
+                header_str += f" {h:<{w-1}}│"
+            logger.info("  " + header_str)
+            logger.info("  " + "│" + "─" * (total_w - 2) + "│")
+
+            for row in rows:
+                row_str = "│"
+                for ci, (cell, w) in enumerate(zip(row, col_widths)):
+                    cell_str = str(cell)
+                    if ci == 0:
+                        row_str += f" {cell_str:<{w-1}}│"
+                    elif any(c in cell_str for c in ["₹", "%", "+"]):
+                        row_str += f" {cell_str:>{w-1}}│"
+                    else:
+                        row_str += f" {cell_str:<{w-1}}│"
+                logger.info("  " + row_str)
+            logger.info("  " + "─" * total_w)
+
+        # ── 1. Overview ──
+        total_trades = len(completed)
+        total_pnl = completed["pnl"].sum()
+        wins = completed[completed["pnl"] > 0]
+        losses = completed[completed["pnl"] <= 0]
+        win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
+        avg_win = wins["pnl"].mean() if len(wins) > 0 else 0
+        avg_loss = losses["pnl"].mean() if len(losses) > 0 else 0
+        profit_factor = abs(wins["pnl"].sum() / losses["pnl"].sum()) if len(losses) > 0 and losses["pnl"].sum() != 0 else float("inf")
+        max_win = completed["pnl"].max()
+        max_loss = completed["pnl"].min()
+
+        # Trading days
+        trade_dates = sorted(completed["trade_date"].unique())
+        first_day = trade_dates[0]
+        last_day = trade_dates[-1]
+        trading_days = len(trade_dates)
+
+        # Capital tracking from portfolio snapshots
+        if not portfolio_df.empty:
+            initial_capital = portfolio_df["total_value"].iloc[0]
+            current_capital = portfolio_df["total_value"].iloc[-1]
+        else:
+            initial_capital = cfg.TRADING_CAPITAL
+            current_capital = initial_capital + total_pnl
+
+        total_return_pct = (current_capital - initial_capital) / initial_capital * 100 if initial_capital > 0 else 0
+
+        overview_rows = [
+            ["Period", f"{first_day} to {last_day}"],
+            ["Trading Days", str(trading_days)],
+            ["Initial Capital", f"₹{initial_capital:,.0f}"],
+            ["Current Capital", f"₹{current_capital:,.0f}"],
+            ["Total P&L", f"{'+'if total_pnl>=0 else ''}₹{total_pnl:,.2f}"],
+            ["Total Return", f"{total_return_pct:+.2f}%"],
+            ["Total Trades", str(total_trades)],
+            ["Win Rate", f"{win_rate:.1f}% ({len(wins)}W / {len(losses)}L)"],
+            ["Profit Factor", f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"],
+            ["Avg Win", f"+₹{avg_win:,.2f}"],
+            ["Avg Loss", f"₹{avg_loss:,.2f}"],
+            ["Max Win", f"+₹{max_win:,.2f}"],
+            ["Max Loss", f"₹{max_loss:,.2f}"],
+        ]
+        print_table("OVERVIEW", ["Metric", "Value"], overview_rows, [22, 30])
+
+        # ── 2. Daily P&L ──
+        daily_pnl = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+        for _, row in completed.iterrows():
+            d = row["trade_date"]
+            daily_pnl[d]["pnl"] += row["pnl"]
+            daily_pnl[d]["trades"] += 1
+            if row["pnl"] > 0:
+                daily_pnl[d]["wins"] += 1
+
+        daily_rows = []
+        running_pnl = 0.0
+        for d in sorted(daily_pnl.keys()):
+            dp = daily_pnl[d]
+            running_pnl += dp["pnl"]
+            pnl_sign = "+" if dp["pnl"] >= 0 else ""
+            cum_sign = "+" if running_pnl >= 0 else ""
+            wr = dp["wins"] / dp["trades"] * 100 if dp["trades"] > 0 else 0
+            daily_rows.append([
+                str(d),
+                d.strftime("%a"),
+                str(dp["trades"]),
+                f"{wr:.0f}%",
+                f"{pnl_sign}₹{dp['pnl']:,.2f}",
+                f"{cum_sign}₹{running_pnl:,.2f}",
+            ])
+        print_table("DAILY P&L", ["Date", "Day", "Trades", "WR", "P&L", "Cumulative"], daily_rows, [14, 6, 8, 6, 16, 16])
+
+        # ── 3. Monthly Summary ──
+        monthly_pnl = defaultdict(lambda: {"pnl": 0.0, "trades": 0, "wins": 0})
+        for _, row in completed.iterrows():
+            m = row["entry_time"].strftime("%Y-%m")
+            monthly_pnl[m]["pnl"] += row["pnl"]
+            monthly_pnl[m]["trades"] += 1
+            if row["pnl"] > 0:
+                monthly_pnl[m]["wins"] += 1
+
+        monthly_rows = []
+        for m in sorted(monthly_pnl.keys()):
+            mp = monthly_pnl[m]
+            pnl_sign = "+" if mp["pnl"] >= 0 else ""
+            wr = mp["wins"] / mp["trades"] * 100 if mp["trades"] > 0 else 0
+            ret_pct = mp["pnl"] / initial_capital * 100 if initial_capital > 0 else 0
+            monthly_rows.append([
+                m,
+                str(mp["trades"]),
+                f"{wr:.0f}%",
+                f"{pnl_sign}₹{mp['pnl']:,.2f}",
+                f"{ret_pct:+.2f}%",
+            ])
+        # Averages
+        if monthly_rows:
+            avg_monthly_pnl = sum(monthly_pnl[m]["pnl"] for m in monthly_pnl) / len(monthly_pnl)
+            avg_monthly_trades = sum(monthly_pnl[m]["trades"] for m in monthly_pnl) / len(monthly_pnl)
+            monthly_rows.append([
+                "AVG",
+                f"{avg_monthly_trades:.1f}",
+                "",
+                f"{'+'if avg_monthly_pnl>=0 else ''}₹{avg_monthly_pnl:,.2f}",
+                f"{avg_monthly_pnl / initial_capital * 100:+.2f}%" if initial_capital > 0 else "",
+            ])
+        print_table("MONTHLY RETURNS", ["Month", "Trades", "WR", "P&L", "Return"], monthly_rows, [10, 8, 6, 16, 10])
+
+        # ── 4. All Trades Detail ──
+        trade_rows = []
+        running = 0.0
+        for idx, (_, t) in enumerate(completed.iterrows(), 1):
+            running += t["pnl"]
+            pnl_sign = "+" if t["pnl"] >= 0 else ""
+            direction = "CE" if "CE" in t["symbol"] else "PE"
+            entry_t = t["entry_time"].strftime("%H:%M")
+            exit_t = t["exit_time"].strftime("%H:%M") if pd.notna(t["exit_time"]) else ""
+            hold_min = (t["exit_time"] - t["entry_time"]).total_seconds() / 60 if pd.notna(t["exit_time"]) else 0
+            trade_rows.append([
+                str(idx),
+                str(t["trade_date"]),
+                direction,
+                t["symbol"],
+                str(t["quantity"]),
+                f"{entry_t}→{exit_t}",
+                f"{hold_min:.0f}m",
+                f"{pnl_sign}₹{t['pnl']:,.2f}",
+                f"₹{running:,.2f}",
+            ])
+        print_table(
+            f"ALL TRADES ({total_trades})",
+            ["#", "Date", "Dir", "Symbol", "Qty", "Time", "Hold", "P&L", "Cumulative"],
+            trade_rows,
+            [4, 12, 5, 18, 6, 14, 6, 14, 14],
+        )
+
+        # ── 5. Risk Metrics ──
+        if not portfolio_df.empty and len(portfolio_df) > 1:
+            portfolio_df["date"] = portfolio_df["datetime"].dt.date
+            daily_equity = portfolio_df.groupby("date")["total_value"].last().reset_index()
+            daily_equity["return_pct"] = daily_equity["total_value"].pct_change() * 100
+
+            peak = daily_equity["total_value"].expanding().max()
+            dd = (daily_equity["total_value"] - peak) / peak * 100
+            max_dd = dd.min()
+
+            avg_daily_return = daily_equity["return_pct"].mean()
+            std_daily_return = daily_equity["return_pct"].std()
+            sharpe = (avg_daily_return / std_daily_return * (252 ** 0.5)) if std_daily_return > 0 else 0
+
+            risk_rows = [
+                ["Max Drawdown", f"{max_dd:.2f}%"],
+                ["Avg Daily Return", f"{avg_daily_return:.3f}%"],
+                ["Daily Volatility", f"{std_daily_return:.3f}%"],
+                ["Sharpe Ratio (ann.)", f"{sharpe:.2f}"],
+                ["Avg Trades/Day", f"{total_trades / max(trading_days, 1):.1f}"],
+            ]
+            print_table("RISK METRICS", ["Metric", "Value"], risk_rows, [22, 16])
+
+        # ── Summary line ──
+        logger.info("")
+        emoji = "+" if total_pnl >= 0 else ""
+        logger.info(
+            f"  Paper Trading: {total_trades} trades over {trading_days} days | "
+            f"P&L: {emoji}₹{total_pnl:,.2f} ({total_return_pct:+.1f}%) | "
+            f"WR: {win_rate:.0f}% | PF: {profit_factor:.2f}"
+        )
+        logger.info("")
 
     def _fetch_real_premium_data(
         self, nifty_df, strike_gap: int = 50
@@ -1905,7 +2225,17 @@ class TradingBot:
         nifty_key = self.config["universe"]["indices"]["NIFTY50"]["instrument_key"]
         from_date = (date.today() - timedelta(days=1095)).isoformat()
         to_date = date.today().isoformat()
-        nifty_df = self.data_fetcher.get_historical_candles(nifty_key, "day", from_date=from_date, to_date=to_date)
+
+        # Backtest: try cached data first, fall back to API only if needed
+        try:
+            nifty_df = self.data_fetcher.get_historical_candles(nifty_key, "day", from_date=from_date, to_date=to_date)
+        except RuntimeError:
+            # Token expired — use cached data from DB directly
+            logger.warning("Upstox token expired — using cached data for backtest")
+            symbol = self.data_fetcher._resolve_symbol(nifty_key)
+            nifty_df = self.data_fetcher._store.get_candles(symbol, "day", from_date, to_date, limit=10000)
+            if nifty_df is not None and not nifty_df.empty:
+                nifty_df = nifty_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
 
         if nifty_df is None or nifty_df.empty or len(nifty_df) < 50:
             logger.error("Insufficient NIFTY data for options backtest")
@@ -1925,9 +2255,16 @@ class TradingBot:
 
         # Load VIX as DataFrame for historical feature computation
         vix_key = self.config["universe"]["indices"].get("INDIA_VIX", {}).get("instrument_key", "NSE_INDEX|India VIX")
-        vix_hist_df = self.data_fetcher.get_historical_candles(
-            vix_key, "day", from_date=from_date, to_date=to_date
-        )
+        try:
+            vix_hist_df = self.data_fetcher.get_historical_candles(
+                vix_key, "day", from_date=from_date, to_date=to_date
+            )
+        except RuntimeError:
+            logger.warning("VIX candle fetch failed (token expired) — using cached data")
+            vix_symbol = self.data_fetcher._resolve_symbol(vix_key)
+            vix_hist_df = self.data_fetcher._store.get_candles(vix_symbol, "day", from_date, to_date, limit=10000)
+            if vix_hist_df is not None and not vix_hist_df.empty:
+                vix_hist_df = vix_hist_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
 
         # Add alternative features (FII/DII + VIX as DataFrame for extended stats)
         nifty_df = self.feature_engine.add_alternative_features(
@@ -2090,6 +2427,12 @@ class TradingBot:
         cfg = get_config()
         cb_daily_loss_halt = cfg.DAILY_LOSS_HALT
         cb_daily_loss_warning = cb_daily_loss_halt / 2  # Half of halt threshold
+        # Drawdown halt: matches live circuit breaker (22% critical)
+        cb_drawdown_warning_pct = 15.0
+        cb_drawdown_halt_pct = 22.0
+        bt_dd_halted = False           # True when drawdown halt active
+        bt_dd_halt_days_remaining = 0  # Pause N days after DD halt
+        bt_dd_skipped_days = 0         # Count of days skipped due to DD halt
         # Active trading mode: 5 trades/day, lower thresholds
         bt_active = getattr(self, "_active_trading", False)
         bt_max_daily_trades = 5 if bt_active else 1  # 1 trade/day (no intraday re-entry in daily backtest)
@@ -2187,8 +2530,34 @@ class TradingBot:
             full_trades_today = 0
             same_day_sl_count = 0
 
-            # Drawdown tracking for reporting (not a halt — daily loss % handles intraday risk)
-            # peak_equity is tracked at end-of-day for max drawdown calculation
+            # ── Drawdown halt check (matches live circuit breaker) ──
+            if bt_dd_halt_days_remaining > 0:
+                bt_dd_halt_days_remaining -= 1
+                bt_dd_skipped_days += 1
+                equity_curve.append({
+                    "date": date_str, "equity": round(cash, 2),
+                    "cash": round(cash, 2), "positions_value": 0,
+                    "n_positions": 0, "daily_return": 0,
+                })
+                if bt_dd_halt_days_remaining == 0:
+                    bt_dd_halted = False
+                continue
+
+            if peak_equity > 0:
+                current_dd_pct = (peak_equity - cash) / peak_equity * 100
+                if current_dd_pct >= cb_drawdown_halt_pct:
+                    # Halt for 3 trading days (matches monthly pause behavior)
+                    bt_dd_halted = True
+                    bt_dd_halt_days_remaining = 3
+                    bt_dd_skipped_days += 1
+                    equity_curve.append({
+                        "date": date_str, "equity": round(cash, 2),
+                        "cash": round(cash, 2), "positions_value": 0,
+                        "n_positions": 0, "daily_return": 0,
+                    })
+                    continue
+                elif current_dd_pct >= cb_drawdown_warning_pct:
+                    cb_conviction_boost = 1.0  # Stricter entry during drawdown
 
             # ── VIX regime ──
             vix = vix_map.get(current_date, 14.0)
@@ -3520,6 +3889,7 @@ class TradingBot:
             ["Real Data Trades", str(real_data_trades)],
             ["Estimated Trades", str(estimated_trades)],
             ["Skipped (VIX/Filter)", str(skipped_vix)],
+            ["Skipped (DD Halt)", str(bt_dd_skipped_days)],
             ["Trades Executed", str(len(trades))],
             ["ML Predictions", str(ml_predictions)],
             ["ML Accuracy", ml_acc_str],
@@ -3617,8 +3987,8 @@ class TradingBot:
             tt_col_w = 16 if is_plus else 10
             print_table("TRADE TYPE PERFORMANCE", ["Type", "Trades", "P&L", "WR", "PF", "Avg Qty"], type_rows, [tt_col_w, 8, 16, 8, 8, 10])
 
-        # ── 11. All Trades Detail (only with --daily flag) ──
-        if trades and getattr(self, "_show_daily_trades", False):
+        # ── 11. All Trades Detail (always shown in --full backtest) ──
+        if trades:
             trade_rows = []
             running_pnl = 0.0
             for idx, t in enumerate(trades, 1):
@@ -3851,9 +4221,9 @@ def main():
         help="Active trading mode: 5 trades/day, direction unlocked, lower VOLATILE threshold, 15-min cooldown, 2 SL halt",
     )
     parser.add_argument(
-        "--daily",
+        "--full",
         action="store_true",
-        help="Show individual trade details in backtest output",
+        help="Run full historical backtest (default backtest shows paper trading report)",
     )
 
     args = parser.parse_args()
@@ -3876,8 +4246,8 @@ def main():
         bot.options_buyer.set_active_trading(True)
     if args.capital and args.mode == "backtest":
         bot._backtest_capital = args.capital
-    if args.daily:
-        bot._show_daily_trades = True
+    if args.full:
+        bot._full_backtest = True
     bot.run()
 
 

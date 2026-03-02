@@ -328,7 +328,7 @@ class UpstoxBroker(BaseBroker):
         return []
 
     def get_funds(self) -> dict[str, Any]:
-        """Get available funds and margin."""
+        """Get available funds and margin from Upstox equity segment."""
         if not self._connected or self._api_client is None:
             return {}
 
@@ -337,13 +337,47 @@ class UpstoxBroker(BaseBroker):
             response = user_api.get_user_fund_margin(api_version="2.0")
             if response.data and hasattr(response.data, "equity"):
                 eq = response.data.equity
+                available = getattr(eq, "available_margin", 0) or 0
+                used = getattr(eq, "used_margin", 0) or 0
+                payin = getattr(eq, "payin_amount", 0) or 0
+                span = getattr(eq, "span_margin", 0) or 0
+                exposure = getattr(eq, "exposure_margin", 0) or 0
+                notional = getattr(eq, "notional_cash", 0) or 0
+                adhoc = getattr(eq, "adhoc_margin", 0) or 0
                 return {
-                    "available_margin": getattr(eq, "available_margin", 0),
-                    "used_margin": getattr(eq, "used_margin", 0),
-                    "payin_amount": getattr(eq, "payin_amount", 0),
+                    "available_margin": available,
+                    "used_margin": used,
+                    "payin_amount": payin,
+                    "span_margin": span,
+                    "exposure_margin": exposure,
+                    "notional_cash": notional,
+                    "adhoc_margin": adhoc,
+                    "total_balance": available + used,
                 }
         except Exception as e:
             logger.error(f"Get funds failed: {e}")
+
+        return {}
+
+    def get_profile(self) -> dict[str, Any]:
+        """Get user profile from Upstox."""
+        if not self._connected or self._api_client is None:
+            return {}
+
+        try:
+            user_api = upstox_client.UserApi(self._api_client)
+            response = user_api.get_profile(api_version="2.0")
+            if response.data:
+                return {
+                    "user_id": getattr(response.data, "user_id", ""),
+                    "user_name": getattr(response.data, "user_name", ""),
+                    "email": getattr(response.data, "email", ""),
+                    "exchanges": getattr(response.data, "exchanges", []),
+                    "products": getattr(response.data, "products", []),
+                    "is_active": getattr(response.data, "is_active", False),
+                }
+        except Exception as e:
+            logger.error(f"Get profile failed: {e}")
 
         return {}
 
