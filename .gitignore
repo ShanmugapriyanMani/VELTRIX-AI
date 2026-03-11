@@ -21,10 +21,9 @@ venv/
 *.swp
 *.swo
 
-# Data & Logs (local only)
-data/
-logs/
-models/
+# Data (large binary — DB tracked separately)
+data/trading_bot.db
+data/cache/
 
 # ML model artifacts
 catboost_info/
