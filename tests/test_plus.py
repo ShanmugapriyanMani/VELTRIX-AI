@@ -32,17 +32,32 @@ class TestTradeTypeDecision:
         result = self.strategy._determine_trade_type("TRENDING", 3.0)
         assert result == "NAKED_BUY"
 
-    def test_medium_conviction_debit_spread(self):
+    def test_medium_conviction_trending_skip(self):
+        # V9 P1: TRENDING + low conviction → SKIP (was DEBIT_SPREAD)
         result = self.strategy._determine_trade_type("TRENDING", 2.0)
-        assert result == "DEBIT_SPREAD"
+        assert result == "SKIP"
 
-    def test_rangebound_low_conviction_debit(self):
+    def test_rangebound_medium_conviction_naked(self):
         result = self.strategy._determine_trade_type("RANGEBOUND", 2.5)
-        assert result == "DEBIT_SPREAD"
+        assert result == "NAKED_BUY"
 
     def test_rangebound_high_conviction_naked(self):
         result = self.strategy._determine_trade_type("RANGEBOUND", 4.0)
         assert result == "NAKED_BUY"
+
+    def test_elevated_credit_spread(self):
+        # V9 P3: ELEVATED regime → CREDIT_SPREAD
+        result = self.strategy._determine_trade_type("ELEVATED", 2.5)
+        assert result == "CREDIT_SPREAD"
+
+    def test_elevated_low_conviction_skip(self):
+        result = self.strategy._determine_trade_type("ELEVATED", 1.5)
+        assert result == "SKIP"
+
+    def test_rangebound_below_25_skip(self):
+        # V9 P1: RANGEBOUND needs conv >= 2.5 for debit spread
+        result = self.strategy._determine_trade_type("RANGEBOUND", 2.0)
+        assert result == "SKIP"
 
 
 class TestSpreadRisk:

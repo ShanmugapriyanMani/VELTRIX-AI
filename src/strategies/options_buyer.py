@@ -30,6 +30,7 @@ from loguru import logger
 
 from src.config.env_loader import get_config
 from src.data.features import FeatureEngine
+from src.risk.manager import clamp_sl_tp_by_premium
 from src.strategies.base import BaseStrategy, Signal, SignalDirection
 
 
@@ -547,16 +548,28 @@ class OptionsBuyerStrategy(BaseStrategy):
                 bear_score += 0.3  # VIX rising = fear increasing
         self._prev_vix = vix
 
-        # === FACTOR 7: ML confidence (weight: 0.3 — informational only) ===
-        # ML accuracy is ~48% (worse than coin flip). Only use as a minor
-        # nudge when confidence is very high (>0.70), never as a driver.
-        ml_prob_up = data.get("ml_direction_prob_up", 0.5)
-        ml_prob_down = data.get("ml_direction_prob_down", 0.5)
+        # === FACTOR 7: ML confidence — V9: DISABLED (48% accuracy) ===
+        # Kept for monitoring only; no score contribution.
 
-        if ml_prob_up > 0.70:
-            bull_score += 0.3
-        elif ml_prob_down > 0.70:
-            bear_score += 0.3
+        # === FACTOR 10: Global Macro (V9 — replaces ML scoring) ===
+        dxy_mom = data.get("dxy_momentum_5d", 0)
+        sp_nifty_corr = data.get("sp500_nifty_corr_20d", 0.5)
+        global_risk = data.get("global_risk_score", 0)
+        sp500_ret = data.get("sp500_prev_return", 0)
+
+        if dxy_mom > 0.5:
+            bear_score += 0.5
+        elif dxy_mom < -0.5:
+            bull_score += 0.5
+        if sp_nifty_corr > 0.5:
+            if sp500_ret > 0.5:
+                bull_score += 0.5
+            elif sp500_ret < -0.5:
+                bear_score += 0.5
+        if global_risk < -1.0:
+            bear_score += 0.5
+        elif global_risk > 1.0:
+            bull_score += 0.5
 
         # === FACTOR 8: OI/PCR consensus — Options OI strategy input (weight: 2.0) ===
         pcr_data = data.get("pcr", {})
@@ -753,16 +766,20 @@ class OptionsBuyerStrategy(BaseStrategy):
         return qty
 
     def _determine_trade_type(self, regime: str, score_diff: float) -> str:
-        """PLUS decision tree for trade type selection.
+        """V9 PLUS decision tree for trade type selection.
 
-        VOLATILE + conviction >= 2.0 → CREDIT_SPREAD
-        VOLATILE + conviction < 2.0  → SKIP
-        Any regime + conviction >= 3.0 → NAKED_BUY
-        Any regime + conviction < 3.0 → DEBIT_SPREAD
+        VOLATILE/ELEVATED + conviction >= threshold → CREDIT_SPREAD
+        High conviction (>= 3.0) → NAKED_BUY
+        RANGEBOUND + conviction >= 2.5 → NAKED_BUY
+        Everything else → SKIP
         """
-        if regime == "VOLATILE":
+        if regime in ("VOLATILE", "ELEVATED"):
             return "CREDIT_SPREAD" if score_diff >= 2.0 else "SKIP"
-        return "NAKED_BUY" if score_diff >= 3.0 else "DEBIT_SPREAD"
+        if score_diff >= 3.0:
+            return "NAKED_BUY"
+        if regime == "RANGEBOUND" and score_diff >= 2.5:
+            return "NAKED_BUY"
+        return "SKIP"
 
     def _build_spread_signal(
         self,
@@ -1154,7 +1171,7 @@ class OptionsBuyerStrategy(BaseStrategy):
         if now >= dt_time(13, 0):
             min_triggers = 2  # Afternoon: harder to enter
         elif now >= dt_time(11, 0):
-            min_triggers = 1  # Mid-day: easier
+            min_triggers = 2  # V9 S2: Mid-day raised to 2/4 (was 1/4)
         else:
             min_triggers = 2  # Morning: standard
 
@@ -1361,9 +1378,13 @@ class OptionsBuyerStrategy(BaseStrategy):
             else:
                 conviction_tier = "low"
             tier_targets = self.DELTA_TARGETS.get(conviction_tier, self.DELTA_TARGETS["medium"])
+            if regime not in tier_targets:
+                logger.warning(f"OptionsBuyer: {regime} regime not in DELTA_TARGETS — falling back to TRENDING")
             delta_min, delta_max = tier_targets.get(
                 regime, tier_targets["TRENDING"]
             )
+            if regime not in self.PREMIUM_SWEET_SPOTS:
+                logger.warning(f"OptionsBuyer: {regime} regime not in PREMIUM_SWEET_SPOTS — falling back to TRENDING")
             sweet_range = self.PREMIUM_SWEET_SPOTS.get(
                 regime, self.PREMIUM_SWEET_SPOTS["TRENDING"]
             )
@@ -1529,13 +1550,9 @@ class OptionsBuyerStrategy(BaseStrategy):
             )
             return None
 
-        # ── Dynamic SL by premium level ──
+        # ── Dynamic SL/TP by premium level ──
         known_prem = live_premium if live_premium > 0 else effective_max_premium
-        if known_prem < 100:
-            adaptive_sl = max(_base_adaptive_sl, 0.30)  # ≥30% for cheap options
-        elif known_prem > 200:
-            adaptive_sl = min(_base_adaptive_sl, 0.20)  # ≤20% for expensive ones
-        # else: keep VIX-adaptive default (_base_adaptive_sl already in adaptive_sl)
+        adaptive_sl, adaptive_tp = clamp_sl_tp_by_premium(known_prem, _base_adaptive_sl, adaptive_tp)
 
         # ── Compute actual lot count now that premium is known ──
         actual_qty = self._compute_lots(

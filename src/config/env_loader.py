@@ -104,6 +104,25 @@ class EnvConfig:
         self.TRENDING_THRESHOLD = _env_float("TRENDING_THRESHOLD", 1.75)
         self.RANGEBOUND_THRESHOLD = _env_float("RANGEBOUND_THRESHOLD", 2.0)
         self.VOLATILE_THRESHOLD = _env_float("VOLATILE_THRESHOLD", 2.5)
+        self.ELEVATED_THRESHOLD = _env_float("ELEVATED_THRESHOLD", 2.0)
+
+        # ── V9 Direction-Aware Thresholds ──
+        self.CE_TRENDING_THRESHOLD = _env_float("CE_TRENDING_THRESHOLD", 2.0)
+        self.CE_RANGEBOUND_THRESHOLD = _env_float("CE_RANGEBOUND_THRESHOLD", 2.25)
+        self.CE_VOLATILE_THRESHOLD = _env_float("CE_VOLATILE_THRESHOLD", 3.0)
+        self.CE_ELEVATED_THRESHOLD = _env_float("CE_ELEVATED_THRESHOLD", 2.5)
+        self.PE_TRENDING_THRESHOLD = _env_float("PE_TRENDING_THRESHOLD", 1.5)
+        self.PE_RANGEBOUND_THRESHOLD = _env_float("PE_RANGEBOUND_THRESHOLD", 1.75)
+        self.PE_VOLATILE_THRESHOLD = _env_float("PE_VOLATILE_THRESHOLD", 2.5)
+        self.PE_ELEVATED_THRESHOLD = _env_float("PE_ELEVATED_THRESHOLD", 2.0)
+
+        # ── V9 Weekly/Monthly Guards ──
+        self.WEEKLY_LOSS_WARNING = _env_float("WEEKLY_LOSS_WARNING", 20000)
+        self.WEEKLY_LOSS_HALT = _env_float("WEEKLY_LOSS_HALT", 35000)
+        self.MONTHLY_LOSS_PCT_BOOST = _env_float("MONTHLY_LOSS_PCT_BOOST", 8.0)
+
+        # ── V9 ML ──
+        self.ML_AUTO_WEIGHT_DEFAULT = _env_float("ML_AUTO_WEIGHT_DEFAULT", 0.0)
 
         # ── Options SL/TP Base Percentages ──
         self.SL_BASE_PCT = _env_int("SL_BASE_PCT", 30)

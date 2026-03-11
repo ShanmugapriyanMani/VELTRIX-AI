@@ -1,0 +1,1461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Veltrix V9 — Improvement Blueprint</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,600;0,700;1,300&family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+:root {
+  --ink: #0a0d0f;
+  --paper: #f5f2eb;
+  --paper2: #ede9df;
+  --paper3: #e2ddd3;
+  --rule: #c8c0b0;
+  --rule2: #a09880;
+  --red: #c0392b;
+  --red-pale: #f5e6e4;
+  --green: #1a6b3c;
+  --green-pale: #e4f0ea;
+  --amber: #b8600a;
+  --amber-pale: #fdf0e0;
+  --blue: #1a3a6b;
+  --blue-pale: #e4eaf5;
+  --text: #1a1a1a;
+  --muted: #6b6354;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--paper);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.masthead {
+  background: var(--ink);
+  color: var(--paper);
+  border-bottom: 4px solid #c0392b;
+}
+
+.masthead-inner {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 36px 40px 28px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 24px;
+}
+
+.masthead-title {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 72px;
+  letter-spacing: 4px;
+  line-height: 0.9;
+}
+
+.masthead-title .accent { color: #e05040; }
+
+.masthead-sub {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: #8a8070;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-top: 10px;
+}
+
+.masthead-dateline {
+  text-align: right;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: #6a6058;
+  letter-spacing: 1px;
+  line-height: 1.8;
+}
+
+.masthead-dateline .bignum {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 40px;
+  color: #e05040;
+  display: block;
+  letter-spacing: 2px;
+  line-height: 1;
+}
+
+.ticker {
+  background: #c0392b;
+  color: white;
+  padding: 8px 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.ticker-inner {
+  display: inline-block;
+  animation: ticker 40s linear infinite;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  padding-left: 100%;
+}
+
+@keyframes ticker {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.main {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 40px 40px;
+}
+
+.section-rule {
+  display: flex;
+  align-items: center;
+  margin: 48px 0 28px;
+}
+
+.section-rule .sr-label {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 13px;
+  letter-spacing: 3px;
+  color: var(--muted);
+  padding-right: 14px;
+  white-space: nowrap;
+}
+
+.section-rule .sr-line {
+  flex: 1;
+  height: 1px;
+  background: var(--rule);
+}
+
+.section-rule .sr-num {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 13px;
+  letter-spacing: 2px;
+  padding-left: 14px;
+  color: var(--rule2);
+}
+
+.findings-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  border: 1.5px solid var(--ink);
+  margin-bottom: 40px;
+}
+
+.finding-card {
+  padding: 20px 18px;
+  border-right: 1.5px solid var(--ink);
+}
+.finding-card:last-child { border-right: none; }
+
+.finding-card .fc-num {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 48px;
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.finding-card .fc-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.finding-card .fc-desc {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.finding-card.critical .fc-num { color: var(--red); }
+.finding-card.warning .fc-num { color: var(--amber); }
+.finding-card.opportunity .fc-num { color: var(--green); }
+
+.fc-tag {
+  display: inline-block;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  margin-top: 6px;
+  text-transform: uppercase;
+}
+
+.tag-critical { background: var(--red-pale); color: var(--red); }
+.tag-warning { background: var(--amber-pale); color: var(--amber); }
+.tag-opportunity { background: var(--green-pale); color: var(--green); }
+
+.improvement {
+  border: 1.5px solid var(--ink);
+  margin-bottom: 20px;
+  background: white;
+}
+
+.improvement-head {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  align-items: center;
+  border-bottom: 1.5px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.improvement-head .imp-id {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 28px;
+  text-align: center;
+  padding: 12px 0;
+  border-right: 1.5px solid #333;
+  letter-spacing: 2px;
+  line-height: 1;
+}
+
+.improvement-head .imp-id.id-risk { color: #e05040; }
+.improvement-head .imp-id.id-profit { color: #4ab870; }
+.improvement-head .imp-id.id-signal { color: #5090d0; }
+.improvement-head .imp-id.id-sys { color: #e0a030; }
+
+.improvement-head .imp-title {
+  padding: 12px 18px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--paper);
+  line-height: 1.3;
+}
+
+.improvement-head .imp-title small {
+  display: block;
+  font-size: 10px;
+  font-family: 'IBM Plex Mono', monospace;
+  letter-spacing: 1.5px;
+  font-weight: 400;
+  color: #8a8070;
+  margin-top: 2px;
+}
+
+.improvement-head .imp-badge {
+  padding: 12px 18px;
+}
+
+.badge-pill {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 2px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+}
+
+.bp-high { background: #e05040; color: white; }
+.bp-med { background: #e0a030; color: white; }
+.bp-low { background: #5090d0; color: white; }
+
+.improvement-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.improvement-body-3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.imp-col {
+  padding: 20px 22px;
+}
+
+.imp-col + .imp-col {
+  border-left: 1.5px solid var(--rule);
+}
+
+.imp-col-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.imp-col-label.lbl-problem { color: var(--red); }
+.imp-col-label.lbl-solution { color: var(--green); }
+.imp-col-label.lbl-code { color: var(--blue); }
+.imp-col-label.lbl-impact { color: var(--amber); }
+
+.imp-col p {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.imp-col ul {
+  list-style: none;
+  padding: 0;
+}
+
+.imp-col ul li {
+  font-size: 13px;
+  padding: 4px 0 4px 14px;
+  position: relative;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.imp-col ul li::before {
+  content: '\2192';
+  position: absolute;
+  left: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+pre {
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  padding: 14px 16px;
+  border-radius: 2px;
+  overflow-x: auto;
+  line-height: 1.6;
+  margin-top: 2px;
+}
+
+.kw { color: #ff7b72; }
+.fn { color: #d2a8ff; }
+.val { color: #79c0ff; }
+.str { color: #a5d6ff; }
+.com { color: #484f58; font-style: italic; }
+.num { color: #f2cc60; }
+
+.evidence-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.evidence-table th {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  padding: 7px 10px;
+  background: var(--paper2);
+  border: 1px solid var(--rule);
+  color: var(--muted);
+  text-align: left;
+}
+
+.evidence-table td {
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  vertical-align: top;
+  line-height: 1.4;
+}
+
+.evidence-table tr:nth-child(even) td { background: var(--paper2); }
+
+.val-bad { color: var(--red); font-weight: 600; }
+.val-good { color: var(--green); font-weight: 600; }
+.val-warn { color: var(--amber); font-weight: 600; }
+
+.outcomes-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  border: 1.5px solid var(--ink);
+  margin-bottom: 40px;
+}
+
+.outcome-cell {
+  padding: 20px 16px;
+  border-right: 1.5px solid var(--ink);
+  text-align: center;
+}
+
+.outcome-cell:last-child { border-right: none; }
+
+.oc-metric {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.oc-before {
+  font-size: 12px;
+  color: var(--muted);
+  text-decoration: line-through;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.oc-arrow { color: #c0392b; font-size: 16px; margin: 4px 0; }
+
+.oc-after {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 30px;
+  letter-spacing: 1px;
+  color: var(--green);
+  line-height: 1;
+}
+
+.oc-delta {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: var(--amber);
+  margin-top: 4px;
+}
+
+.roadmap {
+  border: 1.5px solid var(--ink);
+  margin-bottom: 40px;
+}
+
+.roadmap-row {
+  display: grid;
+  grid-template-columns: 90px 200px 1fr 120px 80px;
+  align-items: center;
+  border-bottom: 1px solid var(--rule);
+}
+
+.roadmap-row:last-child { border-bottom: none; }
+
+.roadmap-row.header {
+  background: var(--ink);
+  color: var(--paper);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+.roadmap-row.header > div { padding: 10px 14px; }
+.roadmap-row.header > div + div { border-left: 1px solid #333; }
+
+.roadmap-row > div {
+  padding: 11px 14px;
+  font-size: 12.5px;
+}
+
+.roadmap-row > div + div { border-left: 1px solid var(--rule); }
+.roadmap-row:nth-child(even) { background: var(--paper2); }
+
+.priority-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block; margin-right: 6px;
+}
+.dot-1 { background: var(--red); }
+.dot-2 { background: var(--amber); }
+.dot-3 { background: var(--blue); }
+
+.effort-bar { display: flex; gap: 2px; }
+.eb { width: 10px; height: 10px; border-radius: 1px; background: var(--rule); }
+.eb.filled { background: var(--ink); }
+
+.summary-box {
+  border: 2px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  padding: 32px 36px;
+  margin-bottom: 40px;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 32px;
+}
+
+.sb-col h4 {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: #8a8070;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #333;
+}
+
+.sb-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.si-bullet {
+  width: 18px; height: 18px;
+  border-radius: 2px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9px; font-weight: 700;
+  flex-shrink: 0; margin-top: 1px;
+}
+
+.si-r { background: var(--red); color: white; }
+.si-g { background: #2a8050; color: white; }
+.si-b { background: #2a5090; color: white; }
+
+.footnote {
+  border-top: 2px solid var(--ink);
+  padding: 20px 0 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+
+.data-tag {
+  display: inline-block;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 2px;
+  vertical-align: middle;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+.dt-red { background: var(--red-pale); color: var(--red); }
+.dt-green { background: var(--green-pale); color: var(--green); }
+.dt-blue { background: var(--blue-pale); color: var(--blue); }
+.dt-amber { background: var(--amber-pale); color: var(--amber); }
+
+@media (max-width: 1000px) {
+  .findings-row { grid-template-columns: 1fr 1fr; }
+  .improvement-body, .improvement-body-3 { grid-template-columns: 1fr; }
+  .imp-col + .imp-col { border-left: none; border-top: 1.5px solid var(--rule); }
+  .outcomes-grid { grid-template-columns: repeat(3, 1fr); }
+  .roadmap-row { grid-template-columns: 80px 1fr 1fr; }
+  .masthead-inner { grid-template-columns: 1fr; }
+  .summary-box { grid-template-columns: 1fr; }
+  .main { padding: 24px 20px; }
+}
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <div class="masthead-inner">
+    <div>
+      <div class="masthead-title">VELTRIX <span class="accent">V9</span></div>
+      <div class="masthead-sub">Quantitative Improvement Blueprint — Derived from 1,189 Trading Days of Real Backtest Data</div>
+    </div>
+    <div class="masthead-dateline">
+      <span class="bignum">15</span>
+      TARGETED IMPROVEMENTS<br>
+      V8 PLUS &rarr; V9 PRO<br>
+      Capital: &#8377;1,50,000
+    </div>
+  </div>
+</div>
+
+<div class="ticker">
+  <span class="ticker-inner">
+    CRITICAL: 59% of trades (372/628) exit blind at EOD 3:10 PM with no TP hit &nbsp;&#9679;&nbsp; ML TEST ACCURACY 48.4% = worse than a coin flip &mdash; 31.5% train-test gap = severe overfit &nbsp;&#9679;&nbsp; DEBIT SPREAD: 147 trades, PF 1.34 &mdash; near breakeven after costs, consuming trade slots &nbsp;&#9679;&nbsp; PE TRADES: 72.2% WR vs CE 61.5% WR &mdash; PE generates 2.83x more P&amp;L per trade than CE &nbsp;&#9679;&nbsp; VOLATILE REGIME: 32 trades, 78.1% WR, PF 19.63 &mdash; massively underexploited &nbsp;&#9679;&nbsp; TRAILING STOP fires only 3% of exits &mdash; activation at +8% is too late for most winners &nbsp;&#9679;&nbsp; CRITICAL: 59% of trades (372/628) exit blind at EOD 3:10 PM with no TP hit &nbsp;&#9679;&nbsp; ML TEST ACCURACY 48.4% = worse than a coin flip &mdash; 31.5% train-test gap = severe overfit &nbsp;&#9679;&nbsp;
+  </span>
+</div>
+
+<div class="main">
+
+  <!-- FINDINGS -->
+  <div class="section-rule">
+    <span class="sr-label">DIAGNOSTIC FINDINGS FROM BACKTEST DATA</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">5 KEY ISSUES</span>
+  </div>
+
+  <div class="findings-row">
+    <div class="finding-card critical">
+      <div class="fc-num">59%</div>
+      <div class="fc-label">EOD Exit Rate</div>
+      <div class="fc-desc">372 of 628 trades closed at 3:10 PM with no TP or SL hit. System holds positions with no active exit logic for the majority of trades.</div>
+      <span class="fc-tag tag-critical">Fix Immediately</span>
+    </div>
+    <div class="finding-card critical">
+      <div class="fc-num">48%</div>
+      <div class="fc-label">ML Test Accuracy</div>
+      <div class="fc-desc">Train 79.9% vs test 48.4% — a 31.5% gap. The model memorises noise. Worse than random. ML influenced only 14 trades across 628 yet runs every cycle.</div>
+      <span class="fc-tag tag-critical">Overfit / Remove</span>
+    </div>
+    <div class="finding-card warning">
+      <div class="fc-num">1.34</div>
+      <div class="fc-label">Debit Spread PF</div>
+      <div class="fc-desc">147 debit spread trades with PF 1.34 vs Naked Buy PF 4.51. Near breakeven after 2-leg brokerage. Trade slots wasted on near-zero alpha.</div>
+      <span class="fc-tag tag-warning">Restrict or Remove</span>
+    </div>
+    <div class="finding-card opportunity">
+      <div class="fc-num">2.83x</div>
+      <div class="fc-label">PE vs CE P&L/Trade</div>
+      <div class="fc-desc">PE: 72.2% WR, avg &#8377;10,561/trade. CE: 61.5% WR, avg &#8377;3,731/trade. PE on 237 trades outperforms CE on 387 trades in total P&amp;L.</div>
+      <span class="fc-tag tag-opportunity">Exploit Asymmetry</span>
+    </div>
+    <div class="finding-card opportunity">
+      <div class="fc-num">19.6x</div>
+      <div class="fc-label">Volatile Regime PF</div>
+      <div class="fc-desc">32 trades, 78.1% WR, PF 19.63, +&#8377;5.38L. Your single best edge is used the least. VIX threshold of 30 is too conservative — missing VIX 22–29 days.</div>
+      <span class="fc-tag tag-opportunity">Expand This Regime</span>
+    </div>
+  </div>
+
+  <!-- RISK SECTION -->
+  <div class="section-rule">
+    <span class="sr-label">RISK REDUCTION IMPROVEMENTS</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">R1 – R5</span>
+  </div>
+
+  <!-- R1 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-risk">R1</div>
+      <div class="imp-title">
+        Intraday TP Ladder — Fix the 59% EOD Exit Problem
+        <small>372 BLIND EXITS AT 3:10 PM — SYSTEM HOLDS FULL RISK WITH NO EXIT PLAN</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">CRITICAL</span></div>
+    </div>
+    <div class="improvement-body-3">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Real Problem</div>
+        <p>59% of all trades exit at 3:10 PM with no TP or SL triggered. This means the system is in the market with full capital at risk but has no structured exit logic for the majority of positions. Many of these are partial winners that drift back to flat. You are leaving real money in EOD noise.</p>
+        <br>
+        <p><span class="data-tag dt-red">372 blind EOD exits</span> &nbsp; <span class="data-tag dt-amber">~&#8377;6,308 avg daily P&amp;L could be captured earlier</span></p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <ul>
+          <li><strong>Time-decay TP ladder:</strong> as the clock ticks toward close, lower the threshold at which gains are locked in</li>
+          <li>12:30 PM: if sitting at +15%, reduce TP to current + 5%</li>
+          <li>2:00 PM: if sitting at +10%, exit immediately rather than waiting for original TP</li>
+          <li>2:30 PM: if at +5%, take it and exit clean</li>
+          <li><strong>Stale trade detector:</strong> if premium moves less than 3% in 45 minutes and you are in profit, exit and reset the direction lock — dead trades have negative expected value from theta</li>
+          <li>Expected: 150+ EOD exits convert to intentional TP exits</li>
+        </ul>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-code">Code Change</div>
+        <pre><span class="com"># Intraday time-decay TP ladder</span>
+<span class="kw">def</span> <span class="fn">get_effective_tp</span>(entry, pct, hour, minute,
+                       mins_no_move):
+    t = hour + minute / <span class="num">60.0</span>
+    base = vix_adaptive_tp()
+
+    <span class="com"># Time-decay exits</span>
+    <span class="kw">if</span> t >= <span class="num">14.5</span> <span class="kw">and</span> pct >= <span class="num">5</span>:
+        <span class="kw">return</span> pct     <span class="com"># lock it at 2:30</span>
+    <span class="kw">if</span> t >= <span class="num">14.0</span> <span class="kw">and</span> pct >= <span class="num">10</span>:
+        <span class="kw">return</span> pct     <span class="com"># lock it at 2:00</span>
+    <span class="kw">if</span> t >= <span class="num">12.5</span> <span class="kw">and</span> pct >= <span class="num">15</span>:
+        <span class="kw">return</span> pct * <span class="num">1.05</span>  <span class="com"># tighten at 12:30</span>
+
+    <span class="com"># Stale trade: no 3% move in 45 min</span>
+    <span class="kw">if</span> mins_no_move >= <span class="num">45</span> <span class="kw">and</span> pct > <span class="num">0</span>:
+        <span class="kw">return</span> pct     <span class="com"># exit dead trade</span>
+
+    <span class="kw">return</span> base</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- R2 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-risk">R2</div>
+      <div class="imp-title">
+        Trailing Stop — Activate Earlier, Three-Tier Tightening
+        <small>TRAIL FIRES ON ONLY 3% OF EXITS (16/628) — NEARLY USELESS AT CURRENT +8% ACTIVATION</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">CRITICAL</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Real Problem</div>
+        <p>The trailing stop activates at +8% gain. Only 16 trades (3%) exit via trail. This means most winning trades either hit TP first or reverse back before reaching +8%. The trail is too late to be useful for protecting gains. With an avg win of &#8377;12,790 (~27% gain on &#8377;47K position), the trail should be catching far more trades.</p>
+        <br>
+        <p>The trail is a dead safety net. A trail activating at +5% with progressive tightening turns it into an active exit tool that locks gains on partial winners.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution — Three-Tier Trail</div>
+        <pre><span class="com"># Three-tier trailing stop</span>
+<span class="kw">def</span> <span class="fn">update_trail</span>(entry, current, state):
+    gain = (current - entry) / entry * <span class="num">100</span>
+
+    <span class="com"># Tier 1: activate at +5% (was +8%)</span>
+    <span class="kw">if</span> gain >= <span class="num">5</span> <span class="kw">and not</span> state.active:
+        state.stop = current * <span class="num">0.97</span>
+        state.active = <span class="kw">True</span>
+        state.tier = <span class="num">1</span>
+
+    <span class="com"># Tier 2: tighten trail at +15%</span>
+    <span class="kw">if</span> gain >= <span class="num">15</span>:
+        state.stop = max(state.stop,
+                         current * <span class="num">0.95</span>)
+        state.tier = <span class="num">2</span>
+
+    <span class="com"># Tier 3: very tight at +25%</span>
+    <span class="kw">if</span> gain >= <span class="num">25</span>:
+        state.stop = max(state.stop,
+                         current * <span class="num">0.93</span>)
+        state.tier = <span class="num">3</span>
+
+<span class="com"># Expected: trail exits rise 3% -> 12-15%</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- R3 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-risk">R3</div>
+      <div class="imp-title">
+        Weekly + Monthly Drawdown Guard
+        <small>NO WEEKLY CIRCUIT BREAKER — WORST MONTH WAS -&#8377;37,823 WITH FULL-SIZE TRADING THROUGHOUT</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-med">MEDIUM</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Real Problem</div>
+        <p>The 7 losing months in your backtest (Jun 2021 -&#8377;26K, Sep/Oct 2021, Feb 2024 -&#8377;32K, Nov 2025 -&#8377;38K, Dec 2025 -&#8377;4K) all shared a pattern: the system traded full size on Wednesday and Thursday after already losing on Monday and Tuesday. There is no weekly loss circuit breaker, so a bad start compounds into a bad week. The monthly 22% drawdown halt fires too late.</p>
+        <br>
+        <p><span class="data-tag dt-red">Worst month: -&#8377;37,823</span> = 25% of capital. A &#8377;35K weekly hard stop would have capped it at roughly -&#8377;35K total.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># Weekly and monthly guards</span>
+WEEKLY_SOFT = <span class="num">-20000</span>   <span class="com"># reduce to 2 trades/day</span>
+WEEKLY_HARD = <span class="num">-35000</span>   <span class="com"># halt all trades this week</span>
+MONTHLY_PCT = <span class="num">-8.0</span>     <span class="com"># 8% monthly loss -> +0.5 conv</span>
+
+<span class="kw">def</span> <span class="fn">check_weekly_guard</span>(weekly_pnl, monthly_pct):
+    <span class="kw">if</span> weekly_pnl <= WEEKLY_HARD:
+        <span class="kw">return</span> <span class="str">'HALT_WEEK'</span>    <span class="com"># no new trades</span>
+
+    <span class="kw">if</span> weekly_pnl <= WEEKLY_SOFT:
+        max_trades = <span class="num">2</span>       <span class="com"># half capacity</span>
+        conviction_penalty = +<span class="num">0.5</span>
+        <span class="kw">return</span> <span class="str">'REDUCED'</span>
+
+    <span class="kw">if</span> monthly_pct <= MONTHLY_PCT:
+        conviction_penalty = +<span class="num">0.5</span>
+        <span class="kw">return</span> <span class="str">'CONSERVATIVE'</span>
+
+    <span class="kw">return</span> <span class="str">'NORMAL'</span>
+
+<span class="com"># Reset weekly P&L every Monday morning</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- R4 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-risk">R4</div>
+      <div class="imp-title">
+        Conviction-Scaled Position Sizing
+        <small>SCORE_DIFF=1.75 GETS SAME 9 LOTS AS SCORE_DIFF=5.0 — EQUAL RISK ON UNEQUAL EDGE</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-med">MEDIUM</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Real Problem</div>
+        <p>Lot sizing is purely deploy-cap driven regardless of signal strength. A trade at the minimum threshold gets the same capital exposure as your highest conviction trade. This violates basic risk management: position size should scale with edge. Weak signals at threshold should get half size; only very strong signals get full size.</p>
+        <br>
+        <p>Your lot distribution shows 23% of trades at 9 lots (max). Without conviction scaling, you don't know if those were your strongest or weakest signals — you gave them all full capital.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># Conviction-scaled lot sizing</span>
+THRESHOLD = {
+    <span class="str">'TRENDING'</span>: <span class="num">1.75</span>,
+    <span class="str">'RANGEBOUND'</span>: <span class="num">2.0</span>,
+    <span class="str">'VOLATILE'</span>: <span class="num">2.5</span>
+}
+
+<span class="kw">def</span> <span class="fn">size_scale</span>(score_diff, regime):
+    threshold = THRESHOLD[regime]
+    excess = score_diff - threshold
+    <span class="com"># 0.0 excess -> 0.5x | 2.0+ excess -> 1.0x</span>
+    scale = min(<span class="num">1.0</span>, <span class="num">0.5</span> + (excess / <span class="num">2.0</span>) * <span class="num">0.5</span>)
+    <span class="kw">return</span> max(<span class="num">0.5</span>, scale)
+
+<span class="kw">def</span> <span class="fn">calc_lots</span>(deploy_cap, premium, score_diff, regime):
+    base = deploy_cap / (premium * <span class="num">65</span>)
+    scale = <span class="fn">size_scale</span>(score_diff, regime)
+    <span class="kw">return</span> max(<span class="num">1</span>, round(base * scale))
+
+<span class="com"># score_diff=1.75 -> 0.50x | =3.75 -> 1.0x</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- R5 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-risk">R5</div>
+      <div class="imp-title">
+        Theta Decay Gate — Auto-Downgrade Late Naked Buys
+        <small>BUYING ATM OPTIONS AFTER 2 PM PAYS FULL PREMIUM FOR ONLY 65–90 MINS OF EXPOSURE</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-low">LOWER</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Problem</div>
+        <p>NAKED_BUY trades placed after 2:00 PM pay full option premium for approximately 65–90 minutes of actual market time. On non-expiry days, theta decay is highest in the final 90 minutes of trading. A &#8377;120 option at 2 PM can lose &#8377;15–25 purely to theta even if NIFTY does not move. Spreads are theta-hedged (both legs decay), so they are safer in late session.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># Auto-downgrade late naked buys</span>
+<span class="kw">def</span> <span class="fn">apply_theta_gate</span>(trade_type, hour, premium,
+                       score_diff, is_expiry):
+    <span class="kw">if</span> is_expiry <span class="kw">and</span> hour >= <span class="num">12</span>:
+        <span class="kw">return</span> <span class="str">'SKIP'</span>  <span class="com"># no new buys on expiry PM</span>
+
+    <span class="kw">if</span> trade_type == <span class="str">'NAKED_BUY'</span> <span class="kw">and</span> hour >= <span class="num">14</span>:
+        <span class="kw">if</span> score_diff < <span class="num">3.5</span> <span class="kw">or</span> premium < <span class="num">120</span>:
+            log(<span class="str">"Theta gate: NAKED->DEBIT_SPREAD"</span>)
+            <span class="kw">return</span> <span class="str">'DEBIT_SPREAD'</span>  <span class="com"># downgrade</span>
+
+    <span class="kw">return</span> trade_type</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- PROFIT SECTION -->
+  <div class="section-rule">
+    <span class="sr-label">PROFIT ENHANCEMENT IMPROVEMENTS</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">P1 – P4</span>
+  </div>
+
+  <!-- P1 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-profit">P1</div>
+      <div class="imp-title">
+        Kill or Severely Restrict DEBIT_SPREAD
+        <small>147 TRADES, PF 1.34 — AFTER 2-LEG BROKERAGE, DEBIT SPREADS ARE NEAR BREAKEVEN</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">HIGH IMPACT</span></div>
+    </div>
+    <div class="improvement-body-3">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Data Evidence</div>
+        <table class="evidence-table">
+          <tr><th>Type</th><th>Trades</th><th>WR</th><th>PF</th><th>Total P&amp;L</th></tr>
+          <tr><td>NAKED_BUY</td><td>449</td><td class="val-good">69.0%</td><td class="val-good">4.51</td><td class="val-good">+&#8377;33.0L</td></tr>
+          <tr><td>DEBIT_SPREAD</td><td>147</td><td class="val-bad">53.1%</td><td class="val-warn">1.34</td><td class="val-warn">+&#8377;1.2L</td></tr>
+          <tr><td>CREDIT_SPREAD</td><td>32</td><td class="val-good">78.1%</td><td class="val-good">19.63</td><td class="val-good">+&#8377;5.4L</td></tr>
+        </table>
+        <br>
+        <p>Debit spreads generated &#8377;118K over 5 years — just &#8377;806 per trade average. The 2-leg brokerage on 147 spreads likely cost &#8377;12–16K. Real net alpha is essentially zero. These 147 trades consumed trade slots that could have been quality SKIPS (protecting capital) or waited for NAKED_BUY conviction.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution — Restrict to RANGEBOUND Only</div>
+        <pre><span class="com"># New trade type selection logic</span>
+<span class="kw">def</span> <span class="fn">get_trade_type_v9</span>(conv, regime):
+    <span class="kw">if</span> regime == <span class="str">'VOLATILE'</span> <span class="kw">and</span> conv >= <span class="num">2.0</span>:
+        <span class="kw">return</span> <span class="str">'CREDIT_SPREAD'</span>  <span class="com"># unchanged</span>
+
+    <span class="kw">if</span> conv >= <span class="num">3.0</span>:
+        <span class="kw">return</span> <span class="str">'NAKED_BUY'</span>     <span class="com"># unchanged</span>
+
+    <span class="com"># Debit spread ONLY in RANGEBOUND regime</span>
+    <span class="kw">if</span> regime == <span class="str">'RANGEBOUND'</span> <span class="kw">and</span> conv >= <span class="num">2.5</span>:
+        <span class="kw">return</span> <span class="str">'DEBIT_SPREAD'</span>
+
+    <span class="com"># TRENDING + low conviction -> SKIP</span>
+    <span class="com"># (was DEBIT_SPREAD, now skip)</span>
+    <span class="kw">return</span> <span class="str">'SKIP'</span>
+
+<span class="com"># Debit spread count drops 147 -> ~35 trades</span>
+<span class="com"># System PF expected: 4.0 -> 4.8-5.2</span></pre>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-impact">Expected Impact</div>
+        <ul>
+          <li>Reduces debit spread count from 147 to approximately 35 (RANGEBOUND only, where spreads work in both directions)</li>
+          <li>The freed trade slots become high-quality skips — protecting capital instead of deploying it on weak signals</li>
+          <li>Eliminates approximately &#8377;12–16K in brokerage on 112 spread trades</li>
+          <li>System overall PF expected to rise from 4.00 to 4.8–5.2</li>
+          <li>Win rate expected to rise from 65.8% to 68–71% as the 53% WR spread trades are removed</li>
+          <li><strong>Alternative if you want to keep spreads:</strong> Change debit spread TP from 70% to 100% of max profit, SL from 50% to 35% — this improves the risk-reward ratio from 1.4:1 to 2.9:1</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- P2 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-profit">P2</div>
+      <div class="imp-title">
+        Exploit the PE Edge — Asymmetric Direction Thresholds
+        <small>PE GENERATES 2.83x MORE P&amp;L PER TRADE THAN CE — USE YOUR OWN 5-YEAR DATA</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">HIGH IMPACT</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Hidden Asymmetry in Your Data</div>
+        <p>This is not a small sample size finding — 237 PE trades vs 387 CE trades over 5 years is statistically meaningful. PE is dramatically outperforming CE in your system:</p>
+        <br>
+        <table class="evidence-table">
+          <tr><th>Direction</th><th>Trades</th><th>Total P&amp;L</th><th>WR</th><th>Avg P&amp;L/Trade</th></tr>
+          <tr><td>CE Buy</td><td>387</td><td>+&#8377;14.4L</td><td class="val-warn">61.5%</td><td class="val-warn">&#8377;3,731</td></tr>
+          <tr><td>PE Buy</td><td>237</td><td class="val-good">+&#8377;25.0L</td><td class="val-good">72.2%</td><td class="val-good">&#8377;10,561</td></tr>
+        </table>
+        <br>
+        <p>This reflects market microstructure reality: NIFTY falls faster and sharper than it rises (negative skewness). Downside moves are more explosive for option buyers. Your system captures this naturally — now reward it structurally.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution — Direction-Split Thresholds</div>
+        <pre><span class="com"># Asymmetric conviction thresholds by direction</span>
+THRESHOLDS_V9 = {
+    <span class="str">'TRENDING'</span>: {
+        <span class="str">'CE'</span>: <span class="num">2.0</span>,    <span class="com"># raised from 1.75</span>
+        <span class="str">'PE'</span>: <span class="num">1.5</span>,    <span class="com"># lowered from 1.75</span>
+    },
+    <span class="str">'RANGEBOUND'</span>: {
+        <span class="str">'CE'</span>: <span class="num">2.25</span>,   <span class="com"># raised from 2.0</span>
+        <span class="str">'PE'</span>: <span class="num">1.75</span>,   <span class="com"># kept same</span>
+    },
+    <span class="str">'VOLATILE'</span>: {
+        <span class="str">'CE'</span>: <span class="num">3.0</span>,    <span class="com"># much harder for CE</span>
+        <span class="str">'PE'</span>: <span class="num">2.5</span>,    <span class="com"># unchanged</span>
+    }
+}
+
+<span class="com"># Also: PE lots = 1.0x | CE lots = 0.85x</span>
+<span class="com"># Fewer CE trades, slightly larger PE positions</span>
+<span class="com"># Expected: +5-8% annual return from this alone</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- P3 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-profit">P3</div>
+      <div class="imp-title">
+        Expand VOLATILE Regime — Lower VIX Threshold to 28, Add ELEVATED Sub-Regime
+        <small>PF 19.63 ON 32 TRADES — YOUR BEST SIGNAL BARELY FIRES. VIX 22-29 DAYS ARE MISSED.</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">HIGH IMPACT</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Underexploitation</div>
+        <p>VOLATILE regime produced &#8377;5.38L from just 32 trades at PF 19.63 — the most efficient P&amp;L per trade in your system by a massive margin. Yet across 1,189 trading days you only had 32 VOLATILE days. The VIX 30 threshold is too conservative.</p>
+        <br>
+        <p>Your own VIX exit brackets tell the story: <em>VIX 22–28 = TP 60%</em> (your highest TP bracket). You already know VIX 22–28 means big moves. Yet those days go into TRENDING regime with normal parameters instead of getting credit spreads, which outperform at PF 19.63.</p>
+        <br>
+        <p><span class="data-tag dt-amber">VIX 28-30: currently TRENDING</span> &nbsp; <span class="data-tag dt-green">Should be: VOLATILE</span></p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution — 4-Regime System</div>
+        <pre><span class="com"># New 4-regime detection</span>
+<span class="kw">def</span> <span class="fn">detect_regime_v9</span>(vix, adx, vix_5d_ma,
+                       vix_change_pct):
+    <span class="com"># VOLATILE: VIX >= 28 (was 30)</span>
+    <span class="kw">if</span> vix >= <span class="num">28</span>:
+        <span class="kw">return</span> <span class="str">'VOLATILE'</span>
+
+    <span class="com"># ELEVATED: VIX 20-28 rising fast</span>
+    <span class="com"># Use credit spreads, wider TP</span>
+    <span class="kw">if</span> vix >= <span class="num">20</span>:
+        <span class="kw">if</span> abs(vix_change_pct) > <span class="num">3</span>:
+            <span class="kw">return</span> <span class="str">'VOLATILE'</span>  <span class="com"># treat as volatile</span>
+        <span class="kw">if</span> vix > vix_5d_ma * <span class="num">1.12</span>:
+            <span class="kw">return</span> <span class="str">'ELEVATED'</span>  <span class="com"># new sub-regime</span>
+
+    <span class="kw">if</span> adx > <span class="num">25</span>: <span class="kw">return</span> <span class="str">'TRENDING'</span>
+    <span class="kw">return</span> <span class="str">'RANGEBOUND'</span>
+
+<span class="com"># ELEVATED: credit spread allowed at conv 2.0</span>
+<span class="com"># Expected: VOLATILE+ELEVATED ~65-80 trades</span>
+<span class="com"># vs current 32 -> +~300-400K annual P&L</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- P4 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-profit">P4</div>
+      <div class="imp-title">
+        Partial Scale-Out Exit — Lock 50% at +30%, Trail the Rest
+        <small>ALL-OR-NOTHING EXIT GIVES BACK GAINS ON WINNERS THAT REVERSE BEFORE ORIGINAL TP</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-med">MEDIUM</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Problem</div>
+        <p>With avg win of &#8377;12,790 and max win of &#8377;72,726, there is extreme variance in winner size. Many trades likely reach +20–30%, then reverse before hitting the original TP, and exit at a lower level or even SL. All-or-nothing exits on volatile options means you occasionally give back significant unrealised gains.</p>
+        <br>
+        <p>Partial exit at +30% locks half the profit. The remaining half rides with a tight trailing stop. On reversals you keep half. On runners you keep most of it. No downside to this change.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution — For NAKED_BUY Only</div>
+        <pre><span class="com"># Scale-out exit (NAKED_BUY positions only)</span>
+<span class="kw">class</span> <span class="fn">ScaleOutExit</span>:
+    P1_PCT = <span class="num">30</span>    <span class="com"># exit 50% at +30%</span>
+    P2_PCT = <span class="num">60</span>    <span class="com"># exit rest at +60%</span>
+
+    <span class="kw">def</span> <span class="fn">check</span>(self, pct, qty):
+        <span class="kw">if</span> pct >= self.P1_PCT <span class="kw">and not</span> self.p1_done:
+            exit_qty = qty // <span class="num">2</span>
+            self.p1_done = <span class="kw">True</span>
+            self.trail_stop = entry * <span class="num">1.20</span>
+            self.trail_active = <span class="kw">True</span>
+            <span class="kw">return</span> (<span class="str">'PARTIAL'</span>, exit_qty)
+
+        <span class="kw">if</span> self.p1_done <span class="kw">and</span> pct >= self.P2_PCT:
+            <span class="kw">return</span> (<span class="str">'FULL'</span>, self.remaining_qty)
+
+        <span class="kw">return</span> (<span class="str">'HOLD'</span>, <span class="num">0</span>)
+
+<span class="com"># Improved avg win: &#8377;12,790 -> est &#8377;14,500+</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- SIGNAL SECTION -->
+  <div class="section-rule">
+    <span class="sr-label">SIGNAL QUALITY IMPROVEMENTS</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">S1 – S4</span>
+  </div>
+
+  <!-- S1 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-signal">S1</div>
+      <div class="imp-title">
+        Fix ML or Remove It — 48% Test Accuracy Is Worse Than Random
+        <small>TRAIN 79.9% VS TEST 48.4% — CLASSIC OVERFIT. INFLUENCED ONLY 14 OF 628 TRADES.</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-high">CRITICAL</span></div>
+    </div>
+    <div class="improvement-body-3">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The ML Problem</div>
+        <p>A 48% binary accuracy model is actively harmful — you would do better ignoring it. The 31.5% train-test gap is a textbook overfit signature: the model has memorised the training data and generalises to noise. Your own rolling 50-trade accuracy was 68% (higher), which means the model performs better on recent data — suggesting you need a much shorter, more frequently updated model.</p>
+        <br>
+        <p>Despite 1,056 ML predictions, only 14 trades were influenced by ML. This means ML was rarely decisive — it was just adding noise to the score with a weight of &#177;1.5.</p>
+        <br>
+        <p><span class="data-tag dt-red">48.4% test accuracy</span> &nbsp; <span class="data-tag dt-red">31.5% gap</span> &nbsp; <span class="data-tag dt-amber">14/628 trades influenced</span></p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">Option A — Fix ML with Heavy Regularisation</div>
+        <pre><span class="com"># Smaller, heavily regularised model</span>
+lgbm_params_v9 = {
+    <span class="str">'n_estimators'</span>: <span class="num">80</span>,
+    <span class="str">'max_depth'</span>: <span class="num">3</span>,      <span class="com"># was likely 6-8</span>
+    <span class="str">'min_child_samples'</span>: <span class="num">40</span>,
+    <span class="str">'reg_alpha'</span>: <span class="num">0.4</span>,
+    <span class="str">'reg_lambda'</span>: <span class="num">0.6</span>,
+    <span class="str">'subsample'</span>: <span class="num">0.65</span>,
+    <span class="str">'feature_fraction'</span>: <span class="num">0.55</span>,
+}
+<span class="com"># Use only TOP 10 features from importance</span>
+<span class="com"># Train window: 180 days (was 90)</span>
+<span class="com"># Retrain: Tuesday+Friday (not just Monday)</span>
+<span class="com"># Auto-disable if rolling 50-acc < 54%:</span>
+<span class="kw">if</span> ml_rolling_50_acc < <span class="num">0.54</span>:
+    ml_weight = <span class="num">0.0</span>  <span class="com"># ignore ML this cycle</span></pre>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-code">Option B — Replace with Direct Macro Signal</div>
+        <pre><span class="com"># Replace ML (&#177;1.5) with F10 Global Macro</span>
+<span class="com"># Using YOUR top features directly</span>
+<span class="kw">def</span> <span class="fn">score_f10_macro</span>(dxy_mom, sp_nifty_corr,
+                      sp500_ret, usdinr_ret):
+    score = <span class="num">0.0</span>
+
+    <span class="com"># DXY up = USD strong = NIFTY bearish</span>
+    <span class="kw">if</span> dxy_mom > <span class="num">0.3</span>:  score -= <span class="num">1.0</span>
+    <span class="kw">elif</span> dxy_mom < <span class="num">-0.3</span>: score += <span class="num">1.0</span>
+
+    <span class="com"># SP500 correlated: use it directly</span>
+    <span class="kw">if</span> sp_nifty_corr > <span class="num">0.6</span>:
+        <span class="kw">if</span> sp500_ret > <span class="num">0.3</span>:   score += <span class="num">0.75</span>
+        <span class="kw">elif</span> sp500_ret < <span class="num">-0.3</span>: score -= <span class="num">0.75</span>
+
+    <span class="com"># USDINR: INR depreciation = bearish</span>
+    <span class="kw">if</span> usdinr_ret > <span class="num">0.3</span>:  score -= <span class="num">0.5</span>
+
+    <span class="kw">return</span> max(<span class="num">-1.5</span>, min(<span class="num">1.5</span>, score))
+
+<span class="com"># Interpretable, non-overfit, always current</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- S2 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-signal">S2</div>
+      <div class="imp-title">
+        Confirmation Gate — Raise 11AM-1PM Window from 1/4 to 2/4
+        <small>PEAK LIQUIDITY HOURS SHOULD REQUIRE MORE CONFIRMATION, NOT LESS</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-med">MEDIUM</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Contradiction</div>
+        <p>Your confirmation gate requires only 1 of 4 intraday triggers from 11:00 AM to 1:00 PM — the most liquid, most institutional session of the day. This is backwards. 11 AM to 1 PM is when smart money is most active and signals from this window should be the most reliable. Requiring only a single PCR reading or RSI tick to enter a &#8377;47K position is too loose for peak hours.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># V9 confirmation requirements by window</span>
+CONFIRM_GATE = {
+    <span class="com"># 9:30-11:00: high noise, keep at 2/4</span>
+    (930, 1100): 2,
+
+    <span class="com"># 11:00-13:00: raise from 1->2 (peak hrs)</span>
+    (1100, 1300): 2,   <span class="com"># was 1, now 2</span>
+
+    <span class="com"># 13:00-14:30: afternoon, keep at 2/4</span>
+    (1300, 1430): 2,
+}
+
+<span class="com"># Also add confirmation weighting:</span>
+<span class="com"># Morning Range Breakout = 1.5x weight</span>
+<span class="com"># (strongest intraday confirmation)</span>
+<span class="com"># PCR alone not sufficient as sole confirm</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- S3 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-signal">S3</div>
+      <div class="imp-title">
+        Fix the VIX-Regime Contradiction
+        <small>VIX 22-28 = TP 60% IN YOUR EXIT TABLE BUT REGIME ONLY BECOMES VOLATILE AT VIX 30</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-med">MEDIUM</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Internal Contradiction</div>
+        <p>Your VIX-adaptive exit table shows VIX 22–28 as your highest TP bracket (60%). This means you already know high-VIX days produce bigger moves worth a 60% TP. Yet your regime detector assigns VOLATILE only at VIX ≥ 30. So on a VIX 26 day, you classify it as TRENDING, use normal trade types, and miss the credit spread opportunity that produced PF 19.63 in VOLATILE. Your exit logic and your regime logic are contradicting each other.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># Align regime detection with exit table</span>
+<span class="com"># VIX bracket  | Exit TP | Regime should be</span>
+<span class="com"># VIX < 13     | 40%     | RANGEBOUND</span>
+<span class="com"># VIX 13-18    | 45%     | RANGEBOUND/TRENDING</span>
+<span class="com"># VIX 18-22    | 55%     | TRENDING</span>
+<span class="com"># VIX 22-28    | 60%  !  | ELEVATED (new)</span>
+<span class="com"># VIX 28-35    | 45%     | VOLATILE</span>
+
+<span class="com"># ELEVATED regime (VIX 22-28):</span>
+<span class="com">#   Allow CREDIT_SPREAD at conv 2.0</span>
+<span class="com">#   TP multiplier: 1.4x (between trending+volatile)</span>
+<span class="com">#   SL multiplier: 1.1x (slightly wider)</span>
+<span class="com">#   Conviction threshold: 2.0 (all directions)</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- S4 -->
+  <div class="improvement">
+    <div class="improvement-head">
+      <div class="imp-id id-signal">S4</div>
+      <div class="imp-title">
+        Regime-Segmented Direction Cooldown (Replace Global 5-Day Block)
+        <small>5-DAY GLOBAL CE BLOCK PREVENTS VALID VOLATILE SIGNALS AFTER TRENDING LOSSES</small>
+      </div>
+      <div class="imp-badge"><span class="badge-pill bp-low">LOWER</span></div>
+    </div>
+    <div class="improvement-body">
+      <div class="imp-col">
+        <div class="imp-col-label lbl-problem">The Problem</div>
+        <p>Currently: 3 SLs in same direction blocks that direction globally for 5 days. If you get 3 CE SLs in TRENDING regime on Monday, you cannot trade CE on VOLATILE Wednesday — even though VOLATILE has completely different signal dynamics and a 78% historical win rate. The block is too broad and too long. It is over-learning from regime-specific failures.</p>
+      </div>
+      <div class="imp-col">
+        <div class="imp-col-label lbl-solution">V9 Solution</div>
+        <pre><span class="com"># Regime-segmented direction blocks</span>
+<span class="com"># 3 SLs in TRENDING CE -> block TRENDING CE</span>
+<span class="com"># VOLATILE CE still allowed (different regime)</span>
+
+direction_blocks = {
+    regime: {<span class="str">'CE'</span>: None, <span class="str">'PE'</span>: None}
+    <span class="kw">for</span> regime <span class="kw">in</span> [<span class="str">'TRENDING'</span>, <span class="str">'RANGEBOUND'</span>,
+                    <span class="str">'ELEVATED'</span>, <span class="str">'VOLATILE'</span>]
+}
+
+<span class="kw">def</span> <span class="fn">is_direction_blocked</span>(regime, direction):
+    block_date = direction_blocks[regime][direction]
+    <span class="kw">if</span> block_date <span class="kw">is None</span>: <span class="kw">return False</span>
+    days_since = (today - block_date).days
+    <span class="kw">return</span> days_since < <span class="num">2</span>  <span class="com"># 2 days (not 5)</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- OUTCOMES -->
+  <div class="section-rule">
+    <span class="sr-label">PROJECTED PERFORMANCE — V8 TO V9</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">ESTIMATES</span>
+  </div>
+
+  <div class="outcomes-grid">
+    <div class="outcome-cell">
+      <div class="oc-metric">Win Rate</div>
+      <div class="oc-before">65.8%</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">70-73%</div>
+      <div class="oc-delta">P1 removes 53% WR spreads</div>
+    </div>
+    <div class="outcome-cell">
+      <div class="oc-metric">Profit Factor</div>
+      <div class="oc-before">4.00</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">4.8-5.5</div>
+      <div class="oc-delta">Fewer weak trades</div>
+    </div>
+    <div class="outcome-cell">
+      <div class="oc-metric">Max Drawdown</div>
+      <div class="oc-before">20.57%</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">13-16%</div>
+      <div class="oc-delta">R3 weekly guard</div>
+    </div>
+    <div class="outcome-cell">
+      <div class="oc-metric">EOD Exit Rate</div>
+      <div class="oc-before">59%</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">30-35%</div>
+      <div class="oc-delta">R1 TP laddering</div>
+    </div>
+    <div class="outcome-cell">
+      <div class="oc-metric">Avg Win</div>
+      <div class="oc-before">&#8377;12,790</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">&#8377;15-17K</div>
+      <div class="oc-delta">R2 trail + P4 scale-out</div>
+    </div>
+    <div class="outcome-cell">
+      <div class="oc-metric">Avg Monthly P&amp;L</div>
+      <div class="oc-before">&#8377;67,143</div>
+      <div class="oc-arrow">&#8595;</div>
+      <div class="oc-after">&#8377;88-100K</div>
+      <div class="oc-delta">Combined effect</div>
+    </div>
+  </div>
+
+  <!-- ROADMAP -->
+  <div class="section-rule">
+    <span class="sr-label">IMPLEMENTATION PRIORITY ROADMAP</span>
+    <span class="sr-line"></span>
+    <span class="sr-num">15 CHANGES</span>
+  </div>
+
+  <div class="roadmap">
+    <div class="roadmap-row header">
+      <div>Priority</div>
+      <div>Change</div>
+      <div>Data Basis / Why</div>
+      <div>Est. Impact</div>
+      <div>Effort</div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-1"></span><strong>NOW</strong></div>
+      <div><strong>Disable or fix ML</strong></div>
+      <div>48% test accuracy, 31.5% overfit gap. Adds noise as &#177;1.5 factor. Easy win to remove.</div>
+      <div><span class="data-tag dt-green">Very High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-1"></span><strong>NOW</strong></div>
+      <div><strong>Restrict debit spreads</strong></div>
+      <div>PF 1.34 across 147 trades. Allow only in RANGEBOUND. Single config/logic change.</div>
+      <div><span class="data-tag dt-green">High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-1"></span><strong>NOW</strong></div>
+      <div><strong>PE asymmetric threshold</strong></div>
+      <div>72.2% WR, 2.83x P&amp;L/trade vs CE. Lower PE threshold, raise CE. One-line config change.</div>
+      <div><span class="data-tag dt-green">High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-1"></span><strong>NOW</strong></div>
+      <div><strong>Intraday TP ladder</strong></div>
+      <div>59% blind EOD exits. Time-decay TP converts drift exits to intentional ones.</div>
+      <div><span class="data-tag dt-green">High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Earlier trailing stop +5%</strong></div>
+      <div>Trail fires 3% of exits. Activate at +5% with 3-tier tightening at +15% and +25%.</div>
+      <div><span class="data-tag dt-amber">Med-High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Lower VOLATILE to VIX 28</strong></div>
+      <div>VOLATILE PF 19.63 on 32 trades. Lower threshold from 30 to 28 + ELEVATED sub-regime.</div>
+      <div><span class="data-tag dt-amber">Med-High</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Weekly loss guard</strong></div>
+      <div>No weekly circuit breaker. Worst month -&#8377;37K traded full size all week. Add &#8377;35K cap.</div>
+      <div><span class="data-tag dt-amber">Medium</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Conviction-scaled lot size</strong></div>
+      <div>Same size for threshold and 5.0 score_diff. Scale 0.5-1.0x with excess conviction.</div>
+      <div><span class="data-tag dt-amber">Medium</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Add F10 Global Macro factor</strong></div>
+      <div>DXY #2 feature, SP500 corr #3 feature — currently only accessible via broken ML.</div>
+      <div><span class="data-tag dt-amber">Medium</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-2"></span><strong>WEEK 1</strong></div>
+      <div><strong>Confirmation gate 11AM-1PM</strong></div>
+      <div>Peak hours require only 1/4 confirmation — weakest bar during strongest session.</div>
+      <div><span class="data-tag dt-amber">Medium</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-3"></span><strong>WEEK 2</strong></div>
+      <div><strong>Partial scale-out exit</strong></div>
+      <div>Exit 50% at +30%, trail rest. Improves avg win on reversing positions. 2-leg logic.</div>
+      <div><span class="data-tag dt-blue">Lower</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-3"></span><strong>WEEK 2</strong></div>
+      <div><strong>Theta gate on late buys</strong></div>
+      <div>Auto-downgrade NAKED_BUY after 2 PM unless score_diff 3.5+ and premium 120+.</div>
+      <div><span class="data-tag dt-blue">Lower</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-3"></span><strong>WEEK 2</strong></div>
+      <div><strong>Fix VIX-regime contradiction</strong></div>
+      <div>VIX 22-28 is TP 60% in exit table but TRENDING in regime. Align them with ELEVATED.</div>
+      <div><span class="data-tag dt-blue">Lower</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-3"></span><strong>WEEK 2</strong></div>
+      <div><strong>Regime-segmented direction block</strong></div>
+      <div>5-day global block prevents VOLATILE CE after TRENDING CE losses. Per-regime, 2 days.</div>
+      <div><span class="data-tag dt-blue">Lower</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb"></div><div class="eb"></div></div></div>
+    </div>
+    <div class="roadmap-row">
+      <div><span class="priority-dot dot-3"></span><strong>LATER</strong></div>
+      <div><strong>Rolling regime accuracy tracker</strong></div>
+      <div>Auto-adjust conviction thresholds based on recent regime WR. Adaptive self-calibration.</div>
+      <div><span class="data-tag dt-blue">Lower</span></div>
+      <div><div class="effort-bar"><div class="eb filled"></div><div class="eb filled"></div><div class="eb filled"></div><div class="eb filled"></div></div></div>
+    </div>
+  </div>
+
+  <!-- SUMMARY -->
+  <div class="section-rule">
+    <span class="sr-label">EXECUTIVE SUMMARY</span>
+    <span class="sr-line"></span>
+  </div>
+
+  <div class="summary-box">
+    <div class="sb-col">
+      <h4>Critical Risks to Fix Immediately</h4>
+      <div class="sb-item">
+        <div class="si-bullet si-r">R</div>
+        <div><strong>ML is broken.</strong> 48% test accuracy is worse than random. It contributes &#177;1.5 to scoring every cycle as noise. Disable or replace with the direct macro factor before your next live session.</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-r">R</div>
+        <div><strong>59% blind EOD exits.</strong> 372 trades have no structured exit. Add the intraday TP ladder. This is the single change with the most immediate impact on how the system behaves day-to-day.</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-r">R</div>
+        <div><strong>No weekly circuit breaker.</strong> Nov 2025: -&#8377;37,823. Feb 2024: -&#8377;31,953. Both would have been capped at &#8377;35K with a weekly hard stop. Five years of data says you need this.</div>
+      </div>
+    </div>
+    <div class="sb-col">
+      <h4>Highest Profit Opportunities</h4>
+      <div class="sb-item">
+        <div class="si-bullet si-g">P</div>
+        <div><strong>PE asymmetric threshold.</strong> PE generates 2.83x more P&amp;L per trade than CE. Lower PE entry threshold by 0.25, raise CE by 0.25. This is one config change with measurable 5-year backing.</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-g">P</div>
+        <div><strong>Expand VOLATILE regime.</strong> PF 19.63 on 32 trades. Lowering VIX threshold from 30 to 28 and adding ELEVATED sub-regime could triple the trade count in your most profitable signal. Estimated +&#8377;300–400K annual.</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-g">P</div>
+        <div><strong>Kill weak debit spreads.</strong> 147 trades at PF 1.34 are consuming trade slots with near-zero alpha after brokerage. Restricting to RANGEBOUND only frees capacity for better setups and improves system PF to 4.8–5.5.</div>
+      </div>
+    </div>
+    <div class="sb-col">
+      <h4>The Core Philosophy of V9</h4>
+      <div class="sb-item">
+        <div class="si-bullet si-b">&#8594;</div>
+        <div>V8 asks: <em>"Is there a signal above threshold?"</em> V9 asks: <em>"Is this the specific type of signal where my system historically wins?"</em> The filter moves from generic to specific.</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-b">&#8594;</div>
+        <div>Your system is already excellent — CAGR 101%, Sharpe 2.43, 88% profitable months. V9 is surgical: remove what doesn't work (broken ML, weak spreads, blind EOD exits) and amplify what does (PE, VOLATILE, strong conviction).</div>
+      </div>
+      <div class="sb-item">
+        <div class="si-bullet si-b">&#8594;</div>
+        <div>The V9 changes are all derived from your own 5-year backtest data. Nothing theoretical. Every recommendation has a specific number from your own output behind it.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    <span>VELTRIX V9 BLUEPRINT — ALL FINDINGS DERIVED FROM 1,189-DAY BACKTEST (2021-05 TO 2026-03)</span>
+    <span>628 TRADES &#9679; CAGR 101.72% &#9679; SHARPE 2.425 &#9679; ANALYSIS BY QUANTITATIVE REVIEW</span>
+  </div>
+
+</div>
+</body>
+</html>

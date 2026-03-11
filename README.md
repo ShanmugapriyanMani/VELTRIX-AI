@@ -1,20 +1,22 @@
-# VELTRIX — AI Trading Bot
+# VELTRIX V9 — Algorithmic Options Trading Bot
 
-Advanced algorithmic trading system for Indian stocks (NSE) using Upstox API V3.
+Algorithmic trading system for NIFTY 50 weekly options (NSE India) using Upstox API V3.
 
 ## Architecture
 
 ```
-LAYER 1: Regime Detection (VIX + NIFTY trend + ADX)
+LAYER 1: Regime Detection (VIX + ADX + VIX trend)
+    → 4 regimes: TRENDING, RANGEBOUND, VOLATILE, ELEVATED
     ↓
-LAYER 2: 8-Factor Scoring (EMA trend, mean reversion, RSI, MACD,
-         Bollinger, MFI, ADX, volume) with regime-adaptive weights
+LAYER 2: 9-Factor Scoring (EMA, RSI, MACD, mean reversion, BB,
+         VIX, OI/PCR, volume, global macro) with regime-adaptive weights
+    → Asymmetric PE/CE conviction thresholds
     ↓
-LAYER 3: ML Predictor (LightGBM; XGBoost/CatBoost optional for backtest)
+LAYER 3: Trade Type Selection
+    → NAKED_BUY (directional) or CREDIT_SPREAD (VOLATILE/ELEVATED only)
     ↓
-LAYER 4: Options Buyer (directional NIFTY options, ATM strike selection)
-    ↓
-LAYER 5: Risk Management (VIX-adaptive SL/TP, trailing stops, circuit breakers)
+LAYER 4: Risk Management (3-layer adaptive SL/TP, 3-tier trailing stops,
+         conviction-scaled lots, weekly/monthly circuit breakers)
     ↓
 EXECUTION: Upstox OrderApiV3 + GTT V3
 ```
@@ -65,11 +67,11 @@ This opens a browser for OAuth2 login. Token is saved locally and expires daily.
 ```bash
 python src/main.py --mode paper
 ```
-Auto-fetches all data sources on startup (incremental), trains ML model, then trades during market hours (9:15 AM - 3:30 PM IST). No separate fetch command needed.
+Auto-fetches all data sources on startup (incremental), then trades during market hours (10:00 AM - 3:10 PM IST).
 
-**Backtest**:
+**Full Historical Backtest** (5-year):
 ```bash
-python src/main.py --mode backtest
+python src/main.py --mode backtest --no-wait
 ```
 
 **Live Trading**:
@@ -84,7 +86,8 @@ python src/main.py --mode live
 | `fetch` | Standalone bulk data download (also runs auto on paper/live startup) |
 | `paper` | Paper trading with simulated execution |
 | `live` | Live trading with real Upstox orders |
-| `backtest` | Options backtest with walk-forward ML and regime detection |
+| `backtest` | Full 5-year historical backtest |
+| `report` | Paper trading performance report (from DB) |
 
 ## Project Structure
 
@@ -106,41 +109,56 @@ python src/main.py --mode live
 │   ├── utils/               # Market calendar (expiry day checks)
 │   ├── backtest/            # Backtesting engine + metrics
 │   ├── dashboard/           # Streamlit UI + Telegram alerts
-│   └── main.py              # Orchestrator
+│   └── main.py              # Orchestrator (~4500 lines)
+├── docs/
+│   └── V9_WORKFLOW.md       # Complete V9 system documentation
 ├── scripts/
 │   └── auth_upstox.py       # OAuth2 authentication
 ├── models/                  # Saved ML models (auto-generated)
 ├── data/                    # SQLite database (auto-generated)
+├── tests/                   # 78 tests (pytest)
 ├── requirements.txt
 └── docker-compose.yaml
 ```
 
 ## Key Details
 
-- **Capital**: ₹50,000 | **Universe**: NIFTY 50 stocks
-- **Options**: NIFTY weekly options, intraday only, ATM strike selection
-- **Options Risk**: VIX-adaptive SL/TP (20-36% SL, 22-86% TP based on regime), trailing stops, max 1 lot, force exit 15:10 (13:30 on expiry days)
-- **ML Model**: LightGBM predictor (XGBoost/CatBoost optional for backtest), 120-day walk-forward training, auto-governance (disables if accuracy < 50%)
-- **Regime Profiles**: TRENDING (conviction 1.75), RANGEBOUND (2.0), VOLATILE (2.5) — each with tuned SL/TP/sizing
-- **Expiry Day Trading**: Allowed before 1 PM with wider SL (+5%) and theta decay penalty
-- **Expiry**: NIFTY weekly expiry = Tuesday
-- **DB**: SQLite with WAL mode, DB-first caching (checks DB before API calls)
+- **Capital**: ₹1,50,000 | **Deploy Cap**: ₹75,000 | **Risk/Trade**: ₹15,000
+- **Options**: NIFTY weekly options (CE/PE), intraday only, ATM strike, lot size 65
+- **Trade Types**: NAKED_BUY (all regimes) + CREDIT_SPREAD (VOLATILE/ELEVATED only)
+- **Regimes**: TRENDING (ADX > 25), RANGEBOUND, VOLATILE (VIX ≥ 28), ELEVATED (VIX 20-28 rising)
+- **Conviction**: Asymmetric PE/CE thresholds — PE lower (72% WR, 2.83x more P&L per trade)
+- **SL/TP**: 3-layer VIX-adaptive × regime multiplier × premium clamp
+- **Trailing Stop**: 3-tier from +5% (3%/5%/7% below peak)
+- **ML**: Permanently disabled (V9.2 rebuild: 49.1% acc, 27.5% gap) — replaced by F10 Global Macro factor
+- **Guards**: Daily -₹20K halt, weekly -₹20K/₹35K soft/hard, monthly -8% boost, per-regime direction cooldown
+- **Expiry**: NIFTY weekly = Tuesday, with theta gate restrictions
 
-## Backtest Results (V8 — Feb 2026)
+## Backtest Results (V9.2 — 5-Year, 2021-2026)
 
-| Metric | Value |
-|--------|-------|
-| Total Return | 1,445% |
-| Trades | 301 |
-| Win Rate | 61.1% |
-| Profit Factor | 2.64 |
-| Sharpe Ratio | 2.778 |
-| Max Drawdown | 14.19% |
+| Metric | V8 | V9.2 |
+|--------|-----|------|
+| Period | 2023-2026 (693 days) | 2021-2026 (1186 days) |
+| Capital | ₹50,000 | ₹1,50,000 |
+| Total Return | 1,445% | 1,787% |
+| CAGR | — | 86.67% |
+| Trades | 301 | 489 |
+| Win Rate | 61.1% | 71.2% |
+| Profit Factor | 2.64 | 4.72 |
+| Sharpe Ratio | 2.778 | 2.633 |
+| Max Drawdown | 14.19% | 16.76% |
+| Profitable Months | 31/34 (91%) | 56/59 (95%) |
 
-**By Regime**: TRENDING 57.2% WR (236 trades), RANGEBOUND 76.6% WR (64 trades)
+**By Regime**: TRENDING 69.6% WR (401 trades, +₹20.8L), RANGEBOUND 78.6% WR (56 trades), VOLATILE 78.1% WR (32 trades)
+
+**By Direction**: PE Buy 74.6% WR (+₹15.6L) outperforms CE Buy 68.9% WR (+₹11.1L)
 
 ## Testing
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v    # 78 tests
 ```
+
+## Documentation
+
+See [docs/V9_WORKFLOW.md](docs/V9_WORKFLOW.md) for complete system workflow, SL/TP logic, exit management, and safety systems.

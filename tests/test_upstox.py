@@ -125,6 +125,10 @@ class TestOrderManager:
         self.cb = CircuitBreaker()
         self.om = OrderManager(self.trader, self.rm, self.cb)
 
+    def teardown_method(self):
+        if self.cb._state_file.exists():
+            self.cb._state_file.unlink()
+
     def test_execute_signal(self):
         import pandas as pd
         signal = {

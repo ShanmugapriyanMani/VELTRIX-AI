@@ -19,10 +19,12 @@ Also enforces:
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 
 import yaml
@@ -150,6 +152,11 @@ class CircuitBreaker:
 
         # Per-minute order tracking (sliding window)
         self._order_timestamps: deque[float] = deque()
+
+        # Persistence: restore weekly/monthly state across restarts
+        self._state_file = Path(__file__).resolve().parent.parent.parent / "data" / "circuit_breaker_state.json"
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        self._load_state()
 
     def check(
         self,
@@ -295,6 +302,9 @@ class CircuitBreaker:
                     f"— paused until {self._monthly_paused_until.isoformat()}"
                 )
                 logger.critical(f"CIRCUIT BREAKER: {self._halt_reason}")
+
+        # Persist state after every trade
+        self.save_state()
 
     def record_order(self) -> bool:
         """
@@ -484,3 +494,70 @@ class CircuitBreaker:
             monthly_pnl=self._monthly_pnl,
             weekly_size_reduced=self._weekly_size_reduced,
         )
+
+    # ── State persistence across restarts ──
+
+    def _load_state(self) -> None:
+        """Load weekly/monthly state from disk on startup."""
+        try:
+            data = json.loads(self._state_file.read_text())
+            saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
+            today = date.today()
+
+            # Weekly state: valid if same week (same Monday)
+            saved_week_start = saved_date - timedelta(days=saved_date.weekday())
+            current_week_start = today - timedelta(days=today.weekday())
+            if saved_week_start == current_week_start:
+                self._weekly_pnl = data.get("weekly_pnl", 0.0)
+                self._weekly_size_reduced = data.get("weekly_size_reduced", False)
+                self._week_start_date = current_week_start
+                if self._weekly_size_reduced:
+                    logger.warning(
+                        f"CIRCUIT BREAKER: Restored weekly state — "
+                        f"PnL ₹{self._weekly_pnl:,.0f}, half-lot active"
+                    )
+
+            # Monthly state: valid if same month
+            saved_month = (saved_date.year, saved_date.month)
+            current_month = (today.year, today.month)
+            if saved_month == current_month:
+                self._monthly_pnl = data.get("monthly_pnl", 0.0)
+                paused_str = data.get("monthly_paused_until")
+                if paused_str:
+                    paused_date = date.fromisoformat(paused_str)
+                    if paused_date > today:
+                        self._monthly_paused_until = paused_date
+                        self._state = BreakerState.PAUSED
+                        self._halt_reason = f"Monthly pause restored — until {paused_date.isoformat()}"
+                        logger.critical(f"CIRCUIT BREAKER: {self._halt_reason}")
+                self._month_start_date = today.replace(day=1)
+
+            # Consecutive losses persist within same day only
+            if saved_date == today:
+                self._consecutive_losses = data.get("consecutive_losses", 0)
+                self._daily_pnl = data.get("daily_pnl", 0.0)
+
+            logger.info(f"CIRCUIT BREAKER: State loaded from {self._state_file}")
+        except FileNotFoundError:
+            pass  # First run — no state file yet
+        except Exception as e:
+            logger.warning(f"CIRCUIT BREAKER: Could not load state: {e}")
+
+    def save_state(self) -> None:
+        """Persist weekly/monthly state to disk. Call after each trade."""
+        try:
+            data = {
+                "date": date.today().isoformat(),
+                "weekly_pnl": round(self._weekly_pnl, 2),
+                "weekly_size_reduced": self._weekly_size_reduced,
+                "monthly_pnl": round(self._monthly_pnl, 2),
+                "monthly_paused_until": (
+                    self._monthly_paused_until.isoformat()
+                    if self._monthly_paused_until else None
+                ),
+                "consecutive_losses": self._consecutive_losses,
+                "daily_pnl": round(self._daily_pnl, 2),
+            }
+            self._state_file.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"CIRCUIT BREAKER: Could not save state: {e}")

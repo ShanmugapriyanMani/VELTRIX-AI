@@ -236,8 +236,16 @@ class OrderManager:
         if max_prem < 99999 and premium > max_prem:
             return {"status": "skipped", "reason": f"Premium ₹{premium:.0f} above max ₹{max_prem:.0f}"}
 
+        # ── Circuit breaker size adjustment ──
+        cb_mult = self.circuit_breaker.get_size_multiplier()
+        if cb_mult <= 0:
+            return {"status": "skipped", "reason": "Circuit breaker halted trading"}
+
         # ── Hard-cap position sizing (₹25K max deployment) ──
         quantity = lot_size  # Already computed by strategy (65 or 32)
+        if cb_mult < 1.0:
+            quantity = max(1, int(quantity * cb_mult))
+            logger.warning(f"Options: Circuit breaker reduced lots {lot_size} → {quantity}")
         position_cost = premium * quantity
 
         # If too expensive, try half lot

@@ -102,6 +102,11 @@ class MLPredictorStrategy(BaseStrategy):
         if not LIGHTGBM_AVAILABLE:
             return False
 
+        # V9.2: ML permanently disabled — skip loading stale models
+        from src.config.env_loader import get_config
+        if not get_config().ML_ENABLED:
+            return False
+
         model_file = Path(self.model_path)
         scaler_file = Path(self.scaler_path)
 

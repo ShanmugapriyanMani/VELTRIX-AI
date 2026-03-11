@@ -32,6 +32,7 @@ class Position:
     entry_time: datetime = field(default_factory=datetime.now)
     trade_id: str = ""
     order_id: str = ""
+    tp_reduced: bool = False
 
     @property
     def value(self) -> float:

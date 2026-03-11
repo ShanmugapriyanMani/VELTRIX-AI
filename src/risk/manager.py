@@ -15,6 +15,28 @@ from loguru import logger
 from src.config.env_loader import get_config, _env_is_set
 
 
+def clamp_sl_tp_by_premium(
+    entry_premium: float, base_sl: float, base_tp: float
+) -> tuple[float, float]:
+    """Adjust SL/TP percentages based on premium level.
+
+    Expensive premiums need massive NIFTY moves for same % TP.
+    At ₹300 delta~0.5: 60% TP needs 360pts (impossible intraday).
+    Cap TP inversely with premium to keep targets achievable.
+
+    Returns (clamped_sl, clamped_tp).
+    """
+    if entry_premium < 100:
+        return max(base_sl, 0.30), base_tp
+    if entry_premium > 300:
+        return min(base_sl, 0.20), min(base_tp, 0.25)
+    if entry_premium > 200:
+        return min(base_sl, 0.20), min(base_tp, 0.35)
+    if entry_premium > 150:
+        return base_sl, min(base_tp, 0.45)
+    return base_sl, base_tp
+
+
 class RiskManager:
     """
     Controls all risk parameters for the trading system.

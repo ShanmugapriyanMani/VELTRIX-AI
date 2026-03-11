@@ -11,7 +11,7 @@ Schedule:
 - 15:30 PM: Market close → daily report
 - Saturday: ML model retraining
 
-CLI: python src/main.py --mode live|paper|backtest|fetch
+CLI: python src/main.py --mode live|paper|backtest|report|fetch
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ from src.strategies.options_buyer import OptionsBuyerStrategy
 from src.strategies.delivery_volume import DeliveryVolumeStrategy
 from src.strategies.ml_predictor import MLPredictorStrategy
 from src.strategies.ensemble import EnsembleStrategy
-from src.risk.manager import RiskManager
+from src.risk.manager import RiskManager, clamp_sl_tp_by_premium
 from src.risk.portfolio import PortfolioManager, Position
 from src.risk.circuit_breaker import CircuitBreaker
 from src.execution.upstox_broker import UpstoxBroker
@@ -175,7 +175,12 @@ class TradingBot:
             return
 
         if self.mode == "backtest":
-            self._run_backtest()
+            logger.info("=== FULL HISTORICAL BACKTEST ===")
+            capital = getattr(self, "_backtest_capital", None) or get_config().TRADING_CAPITAL
+            self._run_options_backtest(capital)
+            return
+        if self.mode == "report":
+            self._run_paper_report()
             return
         logger.info(f"Starting Trading Bot in {self.mode} mode")
 
@@ -207,7 +212,12 @@ class TradingBot:
             logger.info("=== AUTO-FETCH COMPLETE ===")
 
             # ── Phase 0b: Train options direction ML model ──
-            self._train_options_direction_ml()
+            if get_config().ML_ENABLED:
+                self._train_options_direction_ml()
+            else:
+                logger.info("Options ML disabled (ML_ENABLED=false)")
+                self._options_ml_prob_up = 0.5
+                self._options_ml_prob_down = 0.5
 
             # ── Setup complete: show waiting message if before trading window ──
             cfg = get_config()
@@ -679,7 +689,7 @@ class TradingBot:
                         self.portfolio.update_prices(live_prices)
 
                 # ── Time-based exit adjustments on open positions ──
-                # 2:00 PM → reduce TP by 20% (take what you can)
+                # 2:00 PM → reduce TP by 20% ONCE (take what you can)
                 # 2:45 PM → tighten SL to 15% (protect remaining capital)
                 if now_time >= dt_time(14, 45) and self.portfolio.positions:
                     for sym, pos in self.portfolio.positions.items():
@@ -687,12 +697,24 @@ class TradingBot:
                             tight_sl = pos.entry_price * 0.85  # 15% SL
                             if pos.stop_loss < tight_sl:
                                 pos.stop_loss = tight_sl
+                            # Also apply TP reduction if not done yet
+                            if not pos.tp_reduced:
+                                old_tp = pos.take_profit
+                                reduced_tp = pos.entry_price * (1 + (old_tp / pos.entry_price - 1) * 0.80) if old_tp > pos.entry_price else old_tp
+                                if reduced_tp < old_tp:
+                                    pos.take_profit = reduced_tp
+                                    pos.tp_reduced = True
+                                    logger.info(f"TP reduced 20%: {sym} TP {old_tp:.2f} → {reduced_tp:.2f}")
                 elif now_time >= dt_time(14, 0) and self.portfolio.positions:
                     for sym, pos in self.portfolio.positions.items():
                         if pos.instrument_key.startswith("NSE_FO|") and pos.entry_price > 0:
-                            reduced_tp = pos.entry_price * (1 + (pos.take_profit / pos.entry_price - 1) * 0.80) if pos.take_profit > pos.entry_price else pos.take_profit
-                            if reduced_tp < pos.take_profit:
-                                pos.take_profit = reduced_tp
+                            if not pos.tp_reduced:
+                                old_tp = pos.take_profit
+                                reduced_tp = pos.entry_price * (1 + (old_tp / pos.entry_price - 1) * 0.80) if old_tp > pos.entry_price else old_tp
+                                if reduced_tp < old_tp:
+                                    pos.take_profit = reduced_tp
+                                    pos.tp_reduced = True
+                                    logger.info(f"TP reduced 20%: {sym} TP {old_tp:.2f} → {reduced_tp:.2f}")
 
                 # ── Check stops on existing positions ──
                 triggers = self.portfolio.check_stops()
@@ -1071,25 +1093,35 @@ class TradingBot:
                     / nifty_df["close"] * 100
                 )
 
+            # V9.2: Pre-compute entry-contemporaneous ML features (same as backtest)
+            if "datetime" in nifty_df.columns:
+                nifty_df["dist_from_day_open_pct"] = (nifty_df["close"] - nifty_df["open"]) / nifty_df["open"] * 100
+                _dates = pd.to_datetime(nifty_df["datetime"]).dt.date
+                nifty_df["days_to_expiry"] = _dates.apply(
+                    lambda d: (1 - d.weekday()) % 7 if (1 - d.weekday()) % 7 > 0 else 7
+                )
+                _adx = nifty_df.get("adx_14", pd.Series(20.0, index=nifty_df.index))
+                _vix = nifty_df.get("india_vix", pd.Series(15.0, index=nifty_df.index))
+                nifty_df["regime_encoded"] = 1
+                nifty_df.loc[_vix >= 28, "regime_encoded"] = 2
+                nifty_df.loc[(_vix >= 20) & (_vix < 28), "regime_encoded"] = 3
+                nifty_df.loc[(_adx > 25) & (_vix < 20), "regime_encoded"] = 0
+
             ml_features = [
-                # Technical (16 — original)
-                "rsi_14", "rsi_7", "macd_histogram", "macd_line",
-                "bb_position", "bb_width", "atr_pct", "adx_14",
-                "volatility_20d", "returns_1d", "returns_5d", "returns_20d",
-                "price_to_sma50", "body_size", "upper_shadow", "lower_shadow",
-                # Momentum/range (3 — original)
+                # Core technical (5 — kept from V8)
+                "rsi_14", "adx_14", "volatility_20d", "returns_1d", "vix_change_pct",
+                # Technical context (8)
+                "rsi_7", "macd_histogram", "macd_line",
+                "bb_position", "bb_width", "atr_pct",
+                "body_size", "upper_shadow",
+                # Entry-contemporaneous (6 — V9.2 new)
+                "india_vix", "vix_percentile_252d",
+                "dist_from_day_open_pct", "days_to_expiry",
+                "regime_encoded", "fii_net_direction",
+                # Momentum/range (3)
                 "ret_5d", "ret_20d", "range_5d_pct",
-                # FII/DII (5)
-                "fii_net_flow_1d", "fii_net_flow_5d", "fii_flow_momentum",
-                "fii_net_direction", "fii_net_streak",
-                "dii_net_flow_1d", "india_vix",
-                # VIX extended (3)
-                "vix_change_pct", "vix_percentile_252d", "vix_5d_ma",
-                # External markets (9)
-                "sp500_prev_return", "nasdaq_prev_return", "crude_prev_return",
-                "gold_prev_return", "usdinr_prev_return",
-                "sp500_nifty_corr_20d", "crude_nifty_corr_20d",
-                "dxy_momentum_5d", "global_risk_score",
+                # FII flow (3)
+                "fii_net_flow_1d", "fii_flow_momentum", "fii_net_streak",
             ]
             available_feats = [f for f in ml_features if f in nifty_df.columns]
 
@@ -1131,7 +1163,7 @@ class TradingBot:
                 for ca, cb, name in [
                     ("rsi_14", "india_vix", "rsi_x_vix"),
                     ("macd_histogram", "adx_14", "macd_x_adx"),
-                    ("returns_1d", "volume_ratio", "ret_x_vol"),
+                    ("returns_1d", "dist_from_day_open_pct", "ret_x_open_dist"),
                     ("bb_position", "rsi_14", "bb_x_rsi"),
                 ]:
                     if ca in X_train.columns and cb in X_train.columns:
@@ -1206,7 +1238,7 @@ class TradingBot:
             for ca, cb, name in [
                 ("rsi_14", "india_vix", "rsi_x_vix"),
                 ("macd_histogram", "adx_14", "macd_x_adx"),
-                ("returns_1d", "volume_ratio", "ret_x_vol"),
+                ("returns_1d", "dist_from_day_open_pct", "ret_x_open_dist"),
                 ("bb_position", "rsi_14", "bb_x_rsi"),
             ]:
                 if ca in feat_row.columns and cb in feat_row.columns:
@@ -1282,7 +1314,7 @@ class TradingBot:
                     for ca, cb, name in [
                         ("rsi_14", "india_vix", "rsi_x_vix"),
                         ("macd_histogram", "adx_14", "macd_x_adx"),
-                        ("returns_1d", "volume_ratio", "ret_x_vol"),
+                        ("returns_1d", "dist_from_day_open_pct", "ret_x_open_dist"),
                         ("bb_position", "rsi_14", "bb_x_rsi"),
                     ]:
                         if ca in today_row.columns and cb in today_row.columns:
@@ -1337,7 +1369,7 @@ class TradingBot:
         # ── Steps 1-4: Upstox API (requires auth) ──
         upstox_ok = self.data_fetcher.authenticate()
         if upstox_ok:
-            fetch_days = 1095  # 3 years of data
+            fetch_days = 1826  # 5 years of data
 
             # 1. Fetch equity historical data (NIFTY 50)
             logger.info(f"--- [1/8] Fetching NIFTY 50 equity data ---")
@@ -1488,7 +1520,7 @@ class TradingBot:
             return
 
         nifty_key = "NSE_INDEX|Nifty 50"
-        from_date = (date.today() - timedelta(days=1095)).isoformat()
+        from_date = (date.today() - timedelta(days=1826)).isoformat()
         to_date = date.today().isoformat()
 
         # Get NIFTY price range over the period for strike range
@@ -1517,6 +1549,16 @@ class TradingBot:
             (nifty_opts["strike"] >= strike_lo) & (nifty_opts["strike"] <= strike_hi)
         ]
 
+        # In paper/live/report mode: only fetch current + next week's expiry (not all 1000+ contracts)
+        if self.mode != "backtest" and "expiry" in candidates.columns:
+            today_str = date.today().isoformat()
+            # Parse expiry dates, keep only future/current expiries (within 14 days)
+            expiry_cutoff = (date.today() + timedelta(days=14)).isoformat()
+            future_mask = candidates["expiry"].str[:10] >= today_str
+            near_mask = candidates["expiry"].str[:10] <= expiry_cutoff
+            candidates = candidates[future_mask & near_mask]
+            logger.info(f"  Paper/live mode: filtered to {len(candidates)} near-expiry contracts")
+
         fetched = 0
         skipped = 0
         for _, inst in candidates.iterrows():
@@ -1531,7 +1573,11 @@ class TradingBot:
                 cached = self.store.get_candles(key, "day", limit=1)
                 if not cached.empty:
                     cached_max = str(cached["datetime"].max())[:10]
-                    if cached_max >= (date.today() - timedelta(days=2)).isoformat():
+                    # For current contracts: skip if cached within 2 days
+                    # For expired/past contracts: skip if any data exists (won't get new data)
+                    expiry_str = str(inst.get("expiry", ""))[:10] if "expiry" in inst.index else ""
+                    is_expired = expiry_str and expiry_str < date.today().isoformat()
+                    if is_expired or cached_max >= (date.today() - timedelta(days=2)).isoformat():
                         skipped += 1
                         continue
 
@@ -1790,15 +1836,6 @@ class TradingBot:
     # ─────────────────────────────────────────
     # Backtest
     # ─────────────────────────────────────────
-
-    def _run_backtest(self) -> None:
-        """Run backtest mode — paper report (default) or full historical (--full)."""
-        if getattr(self, "_full_backtest", False):
-            logger.info("=== FULL HISTORICAL BACKTEST ===")
-            capital = getattr(self, "_backtest_capital", None) or get_config().TRADING_CAPITAL
-            self._run_options_backtest(capital)
-        else:
-            self._run_paper_report()
 
     def _run_paper_report(self) -> None:
         """
@@ -2065,7 +2102,7 @@ class TradingBot:
         fo_symbols = [s for s in self.store.get_all_symbols("day") if "NSE_FO" in s]
         if fo_symbols:
             logger.info(f"Loading {len(fo_symbols)} F&O instruments from local DB...")
-            from_date = (date.today() - timedelta(days=1095)).isoformat()
+            from_date = (date.today() - timedelta(days=1826)).isoformat()
             to_date = date.today().isoformat()
             bulk = self.store.get_candles_bulk(fo_symbols, "day", from_date, to_date)
 
@@ -2095,7 +2132,7 @@ class TradingBot:
         # Reload from DB after fetch
         fo_symbols = [s for s in self.store.get_all_symbols("day") if "NSE_FO" in s]
         if fo_symbols:
-            from_date = (date.today() - timedelta(days=1095)).isoformat()
+            from_date = (date.today() - timedelta(days=1826)).isoformat()
             to_date = date.today().isoformat()
             bulk = self.store.get_candles_bulk(fo_symbols, "day", from_date, to_date)
 
@@ -2221,21 +2258,26 @@ class TradingBot:
         logger.info(f"=== VELTRIX BACKTEST (NIFTY CE/PE — {mode_label}) ===")
         logger.info("=" * 60)
 
+        # ── Try to authenticate (optional — backtest can run from DB cache) ──
+        self.data_fetcher.authenticate()
+
         # ── Fetch historical NIFTY + VIX data (use all available) ──
         nifty_key = self.config["universe"]["indices"]["NIFTY50"]["instrument_key"]
-        from_date = (date.today() - timedelta(days=1095)).isoformat()
+        from_date = (date.today() - timedelta(days=1826)).isoformat()
         to_date = date.today().isoformat()
 
-        # Backtest: try cached data first, fall back to API only if needed
-        try:
-            nifty_df = self.data_fetcher.get_historical_candles(nifty_key, "day", from_date=from_date, to_date=to_date)
-        except RuntimeError:
-            # Token expired — use cached data from DB directly
-            logger.warning("Upstox token expired — using cached data for backtest")
-            symbol = self.data_fetcher._resolve_symbol(nifty_key)
-            nifty_df = self.data_fetcher._store.get_candles(symbol, "day", from_date, to_date, limit=10000)
-            if nifty_df is not None and not nifty_df.empty:
-                nifty_df = nifty_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
+        # Backtest: load from DB cache (no API needed for historical backtest)
+        symbol = self.data_fetcher._resolve_symbol(nifty_key)
+        nifty_df = self.data_fetcher._store.get_candles(symbol, "day", from_date, to_date, limit=10000)
+        if nifty_df is not None and not nifty_df.empty:
+            nifty_df = nifty_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
+        else:
+            # DB empty — try API as fallback
+            try:
+                nifty_df = self.data_fetcher.get_historical_candles(nifty_key, "day", from_date=from_date, to_date=to_date)
+            except (RuntimeError, Exception) as e:
+                logger.error(f"Cannot load NIFTY data: {e}")
+                nifty_df = None
 
         if nifty_df is None or nifty_df.empty or len(nifty_df) < 50:
             logger.error("Insufficient NIFTY data for options backtest")
@@ -2247,24 +2289,26 @@ class TradingBot:
         nifty_df = self.feature_engine.add_technical_features(nifty_df)
 
         # Fetch India VIX history (extended — DB has up to 5yr from CSVs + Upstox)
-        vix_map = self.data_fetcher.get_vix_history(days=1095)
+        vix_map = self.data_fetcher.get_vix_history(days=1826)
 
         # ── Load FII/DII + external market data for enhanced features ──
         fii_df = self.store.get_fii_dii_history(days=1825)
         external_df = self.store.get_external_data_all()
 
-        # Load VIX as DataFrame for historical feature computation
+        # Load VIX as DataFrame for historical feature computation (DB-first for backtest)
         vix_key = self.config["universe"]["indices"].get("INDIA_VIX", {}).get("instrument_key", "NSE_INDEX|India VIX")
-        try:
-            vix_hist_df = self.data_fetcher.get_historical_candles(
-                vix_key, "day", from_date=from_date, to_date=to_date
-            )
-        except RuntimeError:
-            logger.warning("VIX candle fetch failed (token expired) — using cached data")
-            vix_symbol = self.data_fetcher._resolve_symbol(vix_key)
-            vix_hist_df = self.data_fetcher._store.get_candles(vix_symbol, "day", from_date, to_date, limit=10000)
-            if vix_hist_df is not None and not vix_hist_df.empty:
-                vix_hist_df = vix_hist_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
+        vix_symbol = self.data_fetcher._resolve_symbol(vix_key)
+        vix_hist_df = self.data_fetcher._store.get_candles(vix_symbol, "day", from_date, to_date, limit=10000)
+        if vix_hist_df is not None and not vix_hist_df.empty:
+            vix_hist_df = vix_hist_df[["datetime", "open", "high", "low", "close", "volume", "oi"]]
+        else:
+            try:
+                vix_hist_df = self.data_fetcher.get_historical_candles(
+                    vix_key, "day", from_date=from_date, to_date=to_date
+                )
+            except Exception as e:
+                logger.warning(f"VIX candle fetch failed: {e}")
+                vix_hist_df = None
 
         # Add alternative features (FII/DII + VIX as DataFrame for extended stats)
         nifty_df = self.feature_engine.add_alternative_features(
@@ -2295,31 +2339,48 @@ class TradingBot:
         strike_gap = 50
         brokerage_per_order = 20.0
         stt_sell_pct = 0.000625
+        slippage_per_unit = 1.50  # Round-trip slippage per unit (realistic NIFTY ATM bid-ask)
 
         # ── Load real premium data (DB first, API fallback) ──
         logger.info("Phase 1: Loading option premium data...")
         premium_lookup = self._fetch_real_premium_data(nifty_df, strike_gap)
 
-        # ── ML Walk-forward setup (expanded: 19 → up to 35 features) ──
+        # ── V9.2: Pre-compute entry-contemporaneous ML features ──
+        # dist_from_day_open_pct: how far close is from open (intraday move %)
+        nifty_df["dist_from_day_open_pct"] = (nifty_df["close"] - nifty_df["open"]) / nifty_df["open"] * 100
+        # days_to_expiry: days until next Tuesday (NIFTY weekly expiry)
+        _bt_dates = pd.to_datetime(nifty_df["datetime"]).dt.date
+        nifty_df["days_to_expiry"] = _bt_dates.apply(
+            lambda d: (1 - d.weekday()) % 7 if (1 - d.weekday()) % 7 > 0 else 7
+        )
+        # regime_encoded: TRENDING=0, RANGEBOUND=1, VOLATILE=2, ELEVATED=3
+        # Approximated from ADX + VIX (same logic as backtest loop, pre-computed for ML)
+        _adx_col = nifty_df.get("adx_14", pd.Series(20.0, index=nifty_df.index))
+        _vix_col = nifty_df.get("india_vix", pd.Series(15.0, index=nifty_df.index))
+        nifty_df["regime_encoded"] = 1  # default RANGEBOUND
+        nifty_df.loc[_vix_col >= 28, "regime_encoded"] = 2           # VOLATILE
+        nifty_df.loc[(_vix_col >= 20) & (_vix_col < 28), "regime_encoded"] = 3  # ELEVATED
+        nifty_df.loc[(_adx_col > 25) & (_vix_col < 20), "regime_encoded"] = 0   # TRENDING
+
+        # ── ML Walk-forward setup (V9.2: entry-contemporaneous features) ──
         ml_features = [
-            # Technical (16 — original)
-            "rsi_14", "rsi_7", "macd_histogram", "macd_line",
-            "bb_position", "bb_width", "atr_pct", "adx_14",
-            "volatility_20d", "returns_1d", "returns_5d", "returns_20d",
-            "price_to_sma50", "body_size", "upper_shadow", "lower_shadow",
-            # Momentum/range (3 — original)
+            # Core technical (5 — kept from V8)
+            "rsi_14", "adx_14", "volatility_20d", "returns_1d", "vix_change_pct",
+            # Technical context (8)
+            "rsi_7", "macd_histogram", "macd_line",
+            "bb_position", "bb_width", "atr_pct",
+            "body_size", "upper_shadow",
+            # Entry-contemporaneous (6 — V9.2 new)
+            "india_vix",             # absolute VIX level
+            "vix_percentile_252d",   # VIX vs 1yr history
+            "dist_from_day_open_pct",  # intraday move from open
+            "days_to_expiry",        # theta context (0-7)
+            "regime_encoded",        # TRENDING=0, RANGEBOUND=1, VOLATILE=2, ELEVATED=3
+            "fii_net_direction",     # institutional flow direction
+            # Momentum/range (3)
             "ret_5d", "ret_20d", "range_5d_pct",
-            # FII/DII (7)
-            "fii_net_flow_1d", "fii_net_flow_5d", "fii_flow_momentum",
-            "fii_net_direction", "fii_net_streak",
-            "dii_net_flow_1d", "india_vix",
-            # VIX extended (3)
-            "vix_change_pct", "vix_percentile_252d", "vix_5d_ma",
-            # External markets (9)
-            "sp500_prev_return", "nasdaq_prev_return", "crude_prev_return",
-            "gold_prev_return", "usdinr_prev_return",
-            "sp500_nifty_corr_20d", "crude_nifty_corr_20d",
-            "dxy_momentum_5d", "global_risk_score",
+            # FII flow (3)
+            "fii_net_flow_1d", "fii_flow_momentum", "fii_net_streak",
         ]
         ml_available_feats = [f for f in ml_features if f in nifty_df.columns]
         ml_model = None       # LightGBM (primary)
@@ -2332,7 +2393,7 @@ class TradingBot:
         ml_predictions = 0
         ml_correct = 0
         ml_rolling_window: list[bool] = []  # Last 50 predictions correct/wrong
-        ml_auto_weight = 0.5     # Auto-governance weight (0.0-1.0)
+        ml_auto_weight = 0.0  # V9.2: permanently disabled — 49.1% test acc, 27.5% gap after feature rebuild
         ml_train_accuracies: list[float] = []  # Train acc per fold
         ml_test_accuracies: list[float] = []   # Test acc per fold
         ml_pred_up_count = 0     # How many times predicted UP
@@ -2418,10 +2479,9 @@ class TradingBot:
 
         # Consecutive wins/losses for streak-based sizing
         streak = 0
-        # Consecutive SL tracker for direction pause
-        consec_sl_direction = ""  # "CE" or "PE"
-        consec_sl_count = 0
-        consec_sl_block_days = 0  # Days blocked by 3-SL rule (auto-reset after 5)
+        # V9 S4: Per-regime direction cooldown (replaces global 5-day block)
+        consec_sl_by_regime: dict[str, dict[str, int]] = {}   # {"TRENDING": {"CE": 0, "PE": 0}}
+        consec_sl_block_by_regime: dict[str, int] = {}        # {"TRENDING_CE": 2} = days remaining
 
         # Circuit breaker simulation (from EnvConfig)
         cfg = get_config()
@@ -2446,6 +2506,13 @@ class TradingBot:
         recent_outcomes: list[bool] = []
         _skip_whipsaw = 0
 
+        # V9 R3: Weekly/Monthly loss circuit breaker
+        weekly_pnl = 0.0
+        weekly_halted = False
+        weekly_trades_limit: int | None = None
+        monthly_start_equity = capital
+        monthly_conviction_boost = 0.0
+
         # ── Deploy/risk caps (from EnvConfig) ──
         BT_MAX_DEPLOY = int(cfg.DEPLOY_CAP)
         BT_MAX_RISK = int(cfg.RISK_PER_TRADE)
@@ -2459,6 +2526,20 @@ class TradingBot:
             DEBIT_TP_PCT = cfg.DEBIT_SPREAD_TP_PCT / 100
             CREDIT_SL_MULT = cfg.CREDIT_SPREAD_SL_MULTIPLIER
             CREDIT_TP_PCT = cfg.CREDIT_SPREAD_TP_PCT / 100
+            _dir_thresholds = {
+                "CE": {
+                    "TRENDING": cfg.CE_TRENDING_THRESHOLD,
+                    "RANGEBOUND": cfg.CE_RANGEBOUND_THRESHOLD,
+                    "VOLATILE": cfg.CE_VOLATILE_THRESHOLD,
+                    "ELEVATED": cfg.CE_ELEVATED_THRESHOLD,
+                },
+                "PE": {
+                    "TRENDING": cfg.PE_TRENDING_THRESHOLD,
+                    "RANGEBOUND": cfg.PE_RANGEBOUND_THRESHOLD,
+                    "VOLATILE": cfg.PE_VOLATILE_THRESHOLD,
+                    "ELEVATED": cfg.PE_ELEVATED_THRESHOLD,
+                },
+            }
 
         trading_days = 0
         signals_generated = 0
@@ -2500,6 +2581,16 @@ class TradingBot:
                 "mean_reversion_weight": 1.0,
                 "max_trades_per_day": max(1, bt_max_daily_trades - 1),
             },
+            "ELEVATED": {
+                "size_multiplier": 0.6,
+                "conviction_min": cfg.ELEVATED_THRESHOLD,
+                "sl_multiplier": 1.10,
+                "tp_multiplier": 1.40,
+                "trailing_stop_enabled": True,
+                "ema_weight": 0.75,
+                "mean_reversion_weight": 1.25,
+                "max_trades_per_day": max(1, bt_max_daily_trades - 1),
+            },
         }
 
         logger.info("Phase 2: Running backtest simulation...")
@@ -2530,6 +2621,44 @@ class TradingBot:
             full_trades_today = 0
             same_day_sl_count = 0
 
+            # V9 R3: Weekly reset on Monday
+            if current_date.weekday() == 0:
+                weekly_pnl = 0.0
+                weekly_halted = False
+                weekly_trades_limit = None
+
+            # V9 R3: Monthly reset on 1st of month
+            if current_date.day == 1:
+                monthly_start_equity = cash
+                monthly_conviction_boost = 0.0
+
+            # V9 R3: Weekly halt — skip if halted
+            if weekly_halted:
+                equity_curve.append({
+                    "date": date_str, "equity": round(cash, 2),
+                    "cash": round(cash, 2), "positions_value": 0,
+                    "n_positions": 0, "daily_return": 0,
+                })
+                continue
+
+            # V9 R3: Weekly/Monthly conviction boosts
+            if weekly_pnl <= -cfg.WEEKLY_LOSS_HALT:
+                weekly_halted = True
+                equity_curve.append({
+                    "date": date_str, "equity": round(cash, 2),
+                    "cash": round(cash, 2), "positions_value": 0,
+                    "n_positions": 0, "daily_return": 0,
+                })
+                continue
+            if weekly_pnl <= -cfg.WEEKLY_LOSS_WARNING:
+                weekly_trades_limit = 2
+                cb_conviction_boost += 0.5
+            if monthly_start_equity > 0:
+                monthly_ret_pct = (cash - monthly_start_equity) / monthly_start_equity * 100
+                if monthly_ret_pct <= -cfg.MONTHLY_LOSS_PCT_BOOST:
+                    monthly_conviction_boost = 0.5
+            cb_conviction_boost += monthly_conviction_boost
+
             # ── Drawdown halt check (matches live circuit breaker) ──
             if bt_dd_halt_days_remaining > 0:
                 bt_dd_halt_days_remaining -= 1
@@ -2557,7 +2686,7 @@ class TradingBot:
                     })
                     continue
                 elif current_dd_pct >= cb_drawdown_warning_pct:
-                    cb_conviction_boost = 1.0  # Stricter entry during drawdown
+                    cb_conviction_boost = max(cb_conviction_boost, 1.0)  # Stricter entry during drawdown
 
             # ── VIX regime ──
             vix = vix_map.get(current_date, 14.0)
@@ -2622,9 +2751,12 @@ class TradingBot:
             vix_5d_ago = vix_map.get(vix_5d_ago_date, vix)
             vix_5d_change = vix - vix_5d_ago
 
-            # ── Classify: VOLATILE > TRENDING > RANGEBOUND ──
-            # Priority 1: VOLATILE (risk-off)
-            if vix >= 30:
+            # ── V9: Classify VOLATILE > ELEVATED > TRENDING > RANGEBOUND ──
+            # Priority 1: VOLATILE (VIX ≥ 28, lowered from 30)
+            if vix >= 28:
+                regime = "VOLATILE"
+            elif vix > 20 and vix_5d_change > 3.0:
+                # Rapid VIX spike = treat as VOLATILE
                 regime = "VOLATILE"
             else:
                 volatile_score = 0
@@ -2632,11 +2764,26 @@ class TradingBot:
                     volatile_score += 2
                 if vix_5d_change > 3.0:
                     volatile_score += 2
-                if range_5d > 4.0:  # Wide 5d range proxy for intraday chaos
+                if range_5d > 4.0:
                     volatile_score += 1
 
                 if volatile_score >= 2:
                     regime = "VOLATILE"
+                # Priority 1.5: ELEVATED (VIX 20-28, rising above 5d MA)
+                elif vix >= 20:
+                    vix_5d_values = [
+                        vix_map.get(nifty_df.iloc[max(0, i - k)]["_date"], vix)
+                        for k in range(5)
+                    ]
+                    vix_5d_ma = sum(vix_5d_values) / len(vix_5d_values) if vix_5d_values else vix
+                    if vix_5d_ma > 0 and vix > vix_5d_ma * 1.12:
+                        regime = "ELEVATED"
+                    elif adx > 25:
+                        regime = "TRENDING"
+                    elif adx > 20 and adx_slope > 0 and bb_width > 0.04:
+                        regime = "TRENDING"
+                    else:
+                        regime = "RANGEBOUND"
                 # Priority 2: TRENDING (ride the wave)
                 elif adx > 25:
                     regime = "TRENDING"
@@ -2827,11 +2974,11 @@ class TradingBot:
                     X_train = X_train_raw.loc[valid].copy()
                     y_train = y_train[valid].astype(int)
 
-                    # Add feature interactions
+                    # Add feature interactions (V9.2: entry-contemporaneous combos)
                     for ca, cb, name in [
                         ("rsi_14", "india_vix", "rsi_x_vix"),
                         ("macd_histogram", "adx_14", "macd_x_adx"),
-                        ("returns_1d", "volume_ratio", "ret_x_vol"),
+                        ("returns_1d", "dist_from_day_open_pct", "ret_x_open_dist"),
                         ("bb_position", "rsi_14", "bb_x_rsi"),
                     ]:
                         if ca in X_train.columns and cb in X_train.columns:
@@ -2909,11 +3056,11 @@ class TradingBot:
                 if ml_model is not None and ml_scaler is not None and i >= 1:
                     feat_row = nifty_df.iloc[i-1:i][ml_available_feats].copy()
                     try:
-                        # Add same interactions
+                        # Add same interactions (V9.2)
                         for ca, cb, name in [
                             ("rsi_14", "india_vix", "rsi_x_vix"),
                             ("macd_histogram", "adx_14", "macd_x_adx"),
-                            ("returns_1d", "volume_ratio", "ret_x_vol"),
+                            ("returns_1d", "dist_from_day_open_pct", "ret_x_open_dist"),
                             ("bb_position", "rsi_14", "bb_x_rsi"),
                         ]:
                             if ca in feat_row.columns and cb in feat_row.columns:
@@ -2973,7 +3120,8 @@ class TradingBot:
                             ml_rolling_window.append(is_correct)
                             if len(ml_rolling_window) > 50:
                                 ml_rolling_window.pop(0)
-                            if len(ml_rolling_window) >= 20:
+                            if len(ml_rolling_window) >= 20 and ml_auto_weight > 0:
+                                # Auto-governance only when ML not hard-disabled
                                 rolling_acc = sum(ml_rolling_window) / len(ml_rolling_window)
                                 if rolling_acc > 0.60:
                                     ml_auto_weight = 1.0
@@ -3028,6 +3176,32 @@ class TradingBot:
                     elif close < open_price:
                         bear_score -= 0.3
 
+            # === FACTOR 10: Global Macro (V9 — replaces ML scoring) ===
+            # Uses DXY momentum + SP500/NIFTY correlation (top ML importance features)
+            dxy_mom = float(row.get("dxy_momentum_5d", 0))
+            sp_nifty_corr = float(row.get("sp500_nifty_corr_20d", 0.5))
+            global_risk = float(row.get("global_risk_score", 0))
+            sp500_ret = float(row.get("sp500_prev_return", 0))
+
+            # DXY rising = USD strengthening = EM (India) bearish
+            if dxy_mom > 0.5:
+                bear_score += 0.5
+            elif dxy_mom < -0.5:
+                bull_score += 0.5
+
+            # S&P500 previous day return (when corr is high, NIFTY follows)
+            if sp_nifty_corr > 0.5:
+                if sp500_ret > 0.5:
+                    bull_score += 0.5
+                elif sp500_ret < -0.5:
+                    bear_score += 0.5
+
+            # Global risk score (composite: negative = risk-off)
+            if global_risk < -1.0:
+                bear_score += 0.5
+            elif global_risk > 1.0:
+                bull_score += 0.5
+
             # ── Direction selection (regime-driven conviction filter) ──
             score_diff = abs(bull_score - bear_score)
             directions_to_trade = []
@@ -3035,40 +3209,52 @@ class TradingBot:
             # No regime nudge — regime controls via factor weights, not direction bias.
             # Direction is purely from scoring.
 
-            # Consecutive SL block (V2.2): 3+ SLs in same direction
-            # → block THAT direction for up to 5 days, then auto-reset
-            if consec_sl_count >= 3:
-                chosen_dir = "CE" if bull_score > bear_score else "PE"
-                if chosen_dir == consec_sl_direction:
-                    consec_sl_block_days += 1
-                    if consec_sl_block_days > 5:
-                        # 5-day cooldown complete — reset and allow trading
-                        consec_sl_count = 0
-                        consec_sl_direction = ""
-                        consec_sl_block_days = 0
-                    else:
-                        skipped_vix += 1
-                        _skip_consec_sl += 1
-                        equity_curve.append({
-                            "date": date_str, "equity": round(cash, 2),
-                            "cash": round(cash, 2), "positions_value": 0,
-                            "n_positions": 0, "daily_return": 0,
-                        })
-                        continue
+            # V9 S4: Per-regime direction cooldown (2-day block, not 5-day global)
+            # Decrement block counters once per day
+            for bk in list(consec_sl_block_by_regime.keys()):
+                consec_sl_block_by_regime[bk] -= 1
+                if consec_sl_block_by_regime[bk] <= 0:
+                    del consec_sl_block_by_regime[bk]
+                    # Reset SL counter for this regime+direction
+                    parts = bk.rsplit("_", 1)
+                    if len(parts) == 2 and parts[0] in consec_sl_by_regime:
+                        consec_sl_by_regime[parts[0]][parts[1]] = 0
 
-            # Consecutive SL direction nudge: 3 SLs → nudge opposite (was 2, relaxed)
-            if consec_sl_count >= 3:
-                if consec_sl_direction == "CE":
+            chosen_dir = "CE" if bull_score > bear_score else "PE"
+            block_key = f"{regime}_{chosen_dir}"
+            if block_key in consec_sl_block_by_regime:
+                skipped_vix += 1
+                _skip_consec_sl += 1
+                equity_curve.append({
+                    "date": date_str, "equity": round(cash, 2),
+                    "cash": round(cash, 2), "positions_value": 0,
+                    "n_positions": 0, "daily_return": 0,
+                })
+                continue
+
+            # Per-regime SL nudge: if 2+ SLs in this regime+direction, nudge opposite
+            regime_sls = consec_sl_by_regime.get(regime, {})
+            if regime_sls.get(chosen_dir, 0) >= 2:
+                if chosen_dir == "CE":
                     bear_score += 0.5
-                elif consec_sl_direction == "PE":
+                else:
                     bull_score += 0.5
 
             # ── TRADE TYPE SELECTION ──
-            full_threshold = profile["conviction_min"] + cb_conviction_boost
+            # V9 P2: Direction-aware conviction thresholds (PE easier, CE harder)
+            chosen_dir = "CE" if bull_score > bear_score else "PE"
+            if is_plus:
+                full_threshold = _dir_thresholds[chosen_dir].get(regime, profile["conviction_min"]) + cb_conviction_boost
+            else:
+                full_threshold = profile["conviction_min"] + cb_conviction_boost
 
             if is_plus:
-                # PLUS decision tree: VOLATILE→CREDIT, high conviction→NAKED, else→DEBIT
-                if regime == "VOLATILE":
+                # V9 PLUS decision tree:
+                # VOLATILE/ELEVATED → CREDIT_SPREAD
+                # High conviction → NAKED_BUY
+                # RANGEBOUND + conv ≥ 2.5 → DEBIT_SPREAD
+                # Everything else → SKIP
+                if regime in ("VOLATILE", "ELEVATED"):
                     if score_diff >= full_threshold:
                         trade_type = "CREDIT_SPREAD"
                     else:
@@ -3082,8 +3268,8 @@ class TradingBot:
                         continue
                 elif score_diff >= 3.0 + cb_conviction_boost:
                     trade_type = "NAKED_BUY"
-                elif score_diff >= full_threshold:
-                    trade_type = "DEBIT_SPREAD"
+                elif regime == "RANGEBOUND" and score_diff >= max(full_threshold, 2.5):
+                    trade_type = "NAKED_BUY"
                 else:
                     skipped_vix += 1
                     _skip_conviction += 1
@@ -3134,6 +3320,8 @@ class TradingBot:
 
                 # Check max trades per day (regime-driven, capped on expiry)
                 max_today = min(expiry_max_trades, profile["max_trades_per_day"])
+                if weekly_trades_limit is not None:
+                    max_today = min(max_today, weekly_trades_limit)
                 if trade_type == "FULL" and full_trades_today >= max_today:
                     break
                 if day_trades >= max_today + 1:  # Total cap
@@ -3190,6 +3378,11 @@ class TradingBot:
                 if real_data is not None and abs(strike - atm_strike) > 3 * strike_gap:
                     real_data = None
 
+                # V9 R5: Theta gate — on expiry day, skip weak naked buys
+                if is_expiry and is_plus and trade_type == "NAKED_BUY" and real_data is not None:
+                    if score_diff < 3.5 or real_data["open"] < 120:
+                        continue  # Skip — too risky on expiry
+
                 # ── PLUS: Find second leg premium for spreads ──
                 leg2_data = None
                 leg2_strike = 0
@@ -3230,7 +3423,7 @@ class TradingBot:
 
                     if leg2_data is None:
                         # Cannot construct spread — fallback to naked if high conviction
-                        if score_diff >= 3.0 + cb_conviction_boost and regime != "VOLATILE":
+                        if score_diff >= 3.0 + cb_conviction_boost and regime not in ("VOLATILE", "ELEVATED"):
                             trade_type = "NAKED_BUY"
                         else:
                             if data_source == "REAL" if real_data else False:
@@ -3246,37 +3439,28 @@ class TradingBot:
                     low_premium = real_data["low"]
                     close_premium = real_data["close"]
 
-                    # Dynamic SL by premium level:
-                    # Cheap premiums need room to breathe, expensive ones get tighter
-                    if entry_premium < 100:
-                        prem_sl = max(adj_sl, 0.30)  # ≥30% for cheap options
-                    elif entry_premium > 200:
-                        prem_sl = min(adj_sl, 0.20)  # ≤20% for expensive ones
-                    else:
-                        prem_sl = adj_sl              # Keep VIX-adaptive default
+                    prem_sl, prem_tp = clamp_sl_tp_by_premium(entry_premium, adj_sl, adj_tp)
 
                     sl_price = entry_premium * (1 - prem_sl)
-                    tp_price = entry_premium * (1 + adj_tp)
+                    tp_price = entry_premium * (1 + prem_tp)
 
-                    # Dynamic trailing stop (all regimes, lower activation)
+                    # V9 R2: 3-tier trailing stop (activation lowered to +5%)
                     trail_floor = None
                     high_gain_pct = (high_premium - entry_premium) / entry_premium
                     if trail_enabled:
-                        # TRENDING/VOLATILE: 4-tier trail starting at +8%
-                        if high_gain_pct >= 0.50:
-                            trail_floor = entry_premium * 1.35
-                        elif high_gain_pct >= 0.35:
-                            trail_floor = entry_premium * 1.22
+                        # TRENDING/VOLATILE/ELEVATED: 3-tier trail from +5%
+                        if high_gain_pct >= 0.25:
+                            trail_floor = high_premium * 0.93   # 7% below peak
                         elif high_gain_pct >= 0.15:
-                            trail_floor = entry_premium * 1.10
-                        elif high_gain_pct >= 0.08:
-                            trail_floor = entry_premium * 1.03
+                            trail_floor = high_premium * 0.95   # 5% below peak
+                        elif high_gain_pct >= 0.05:
+                            trail_floor = high_premium * 0.97   # 3% below peak
                     else:
                         # RANGEBOUND: lighter trail (only on big gains)
                         if high_gain_pct >= 0.25:
-                            trail_floor = entry_premium * 1.15
+                            trail_floor = high_premium * 0.93
                         elif high_gain_pct >= 0.15:
-                            trail_floor = entry_premium * 1.08
+                            trail_floor = high_premium * 0.95
 
                     sl_hit = low_premium <= sl_price
                     tp_hit = high_premium >= tp_price
@@ -3308,11 +3492,26 @@ class TradingBot:
                     else:
                         # On expiry: force exit ~1:30 PM → use midpoint of day (more theta decay)
                         if is_expiry:
-                            # Approximate 1:30 PM exit: use 60% of close_premium (theta penalty)
                             exit_premium = entry_premium + (close_premium - entry_premium) * 0.6
                         else:
                             exit_premium = close_premium
-                        exit_reason = "eod_exit"
+
+                        # V9 R1: TP Ladder — capture partial gains on profitable EOD exits
+                        if high_premium > entry_premium and exit_premium <= entry_premium * 1.02:
+                            # Day was profitable intraday but closed flat/negative
+                            if high_premium >= entry_premium * 1.15:
+                                exit_premium = entry_premium * 1.10
+                                exit_reason = "tp_ladder"
+                            elif high_premium >= entry_premium * 1.10:
+                                exit_premium = entry_premium * 1.05
+                                exit_reason = "tp_ladder"
+                            elif high_premium >= entry_premium * 1.05:
+                                exit_premium = entry_premium * 1.025
+                                exit_reason = "tp_ladder"
+                            else:
+                                exit_reason = "eod_exit"
+                        else:
+                            exit_reason = "eod_exit"
 
                     real_data_trades += 1
                 else:
@@ -3346,17 +3545,11 @@ class TradingBot:
                         (direction == "PE" and nifty_move < 0)
                     )
 
-                    # Dynamic SL by premium level (same as real data)
-                    if entry_premium < 100:
-                        prem_sl = max(adj_sl, 0.30)
-                    elif entry_premium > 200:
-                        prem_sl = min(adj_sl, 0.20)
-                    else:
-                        prem_sl = adj_sl
+                    prem_sl, prem_tp = clamp_sl_tp_by_premium(entry_premium, adj_sl, adj_tp)
                     # Estimated trades: tighter SL (less data confidence)
                     est_sl = prem_sl * 0.75
                     sl_price = entry_premium * (1 - est_sl)
-                    tp_price = entry_premium * (1 + adj_tp)
+                    tp_price = entry_premium * (1 + prem_tp)
 
                     if correct_direction:
                         nifty_move_pct = abs(nifty_move) / open_price * 100
@@ -3415,6 +3608,10 @@ class TradingBot:
                 if entry_premium <= 0:
                     continue
 
+                # V9 R4: Conviction-scaled lot sizing (0.5x at threshold, 1.0x at +2.0)
+                excess = max(0, score_diff - full_threshold)
+                conviction_scale = min(1.0, 0.5 + (excess / 2.0) * 0.5)
+
                 # PLUS spread lot sizing uses net premium / max loss per unit
                 if is_plus and trade_type == "DEBIT_SPREAD" and leg2_data is not None:
                     leg2_entry = leg2_data["open"]
@@ -3423,7 +3620,7 @@ class TradingBot:
                         continue
                     lots_by_deploy = int(BT_MAX_DEPLOY / (net_debit * lot_size))
                     lots_by_risk = int(BT_MAX_RISK / (net_debit * lot_size))
-                    bt_lots = max(1, min(lots_by_deploy, lots_by_risk))
+                    bt_lots = max(1, int(min(lots_by_deploy, lots_by_risk) * conviction_scale))
                     lot_used = bt_lots * lot_size
                     position_cost = net_debit * lot_used
 
@@ -3438,7 +3635,7 @@ class TradingBot:
                     if max_loss_per_unit <= 0:
                         max_loss_per_unit = SPREAD_WIDTH
                     lots_by_risk = int(BT_MAX_RISK / (max_loss_per_unit * lot_size)) if max_loss_per_unit > 0 else 1
-                    bt_lots = max(1, lots_by_risk)
+                    bt_lots = max(1, int(lots_by_risk * conviction_scale))
                     lot_used = bt_lots * lot_size
                     position_cost = credit * lot_used  # Credit received (for pnl_pct)
 
@@ -3448,7 +3645,7 @@ class TradingBot:
                     actual_sl = prem_sl if prem_sl > 0 else adj_sl
                     lots_by_risk = int(trade_risk / (entry_premium * actual_sl * lot_size)) if actual_sl > 0 else lots_by_deploy
                     bt_lots = min(lots_by_deploy, lots_by_risk)
-                    bt_lots = max(1, bt_lots)
+                    bt_lots = max(1, int(bt_lots * conviction_scale))
                     lot_used = bt_lots * lot_size
                     position_cost = entry_premium * lot_used
 
@@ -3483,7 +3680,7 @@ class TradingBot:
                         gross_pnl = max_profit_amt
                         exit_reason = "spread_tp"
                     stt = abs(exit_premium) * lot_used * stt_sell_pct
-                    total_charges = brokerage_per_order * 4 + stt  # 4 legs total
+                    total_charges = brokerage_per_order * 4 + stt + slippage_per_unit * 2 * lot_used
                     net_pnl = gross_pnl - total_charges
                     pnl_pct = (net_pnl / (net_debit_pnl * lot_used)) * 100 if net_debit_pnl > 0 else 0
 
@@ -3506,17 +3703,35 @@ class TradingBot:
                     else:
                         exit_reason = "eod_exit"
                     stt = abs(sell_exit_p) * lot_used * stt_sell_pct
-                    total_charges = brokerage_per_order * 4 + stt
+                    total_charges = brokerage_per_order * 4 + stt + slippage_per_unit * 2 * lot_used
                     net_pnl = gross_pnl - total_charges
                     pnl_pct = (net_pnl / max(credit_received * lot_used, 1)) * 100
 
                 else:
-                    # BASIC / NAKED_BUY: original P&L (unchanged)
-                    gross_pnl = (exit_premium - entry_premium) * lot_used
-                    stt = exit_premium * lot_used * stt_sell_pct
-                    total_charges = brokerage_per_order * 2 + stt
+                    # BASIC / NAKED_BUY P&L
+                    # V9 P4: Partial scale-out — 50% exit at +30%, rest at normal exit
+                    _high_prem = high_premium if data_source == "REAL" else exit_premium
+                    if trade_type == "NAKED_BUY" and _high_prem >= entry_premium * 1.30:
+                        partial_lots = lot_used // 2
+                        if partial_lots > 0:
+                            remaining_lots = lot_used - partial_lots
+                            partial_exit_p = entry_premium * 1.30
+                            gross_pnl = (
+                                (partial_exit_p - entry_premium) * partial_lots
+                                + (exit_premium - entry_premium) * remaining_lots
+                            )
+                            stt = (partial_exit_p * partial_lots + exit_premium * remaining_lots) * stt_sell_pct
+                            total_charges = brokerage_per_order * 3 + stt + slippage_per_unit * lot_used
+                        else:
+                            gross_pnl = (exit_premium - entry_premium) * lot_used
+                            stt = exit_premium * lot_used * stt_sell_pct
+                            total_charges = brokerage_per_order * 2 + stt + slippage_per_unit * lot_used
+                    else:
+                        gross_pnl = (exit_premium - entry_premium) * lot_used
+                        stt = exit_premium * lot_used * stt_sell_pct
+                        total_charges = brokerage_per_order * 2 + stt + slippage_per_unit * lot_used
                     net_pnl = gross_pnl - total_charges
-                    pnl_pct = (net_pnl / position_cost) * 100
+                    pnl_pct = (net_pnl / position_cost) * 100 if position_cost > 0 else 0
 
                 # Update streak + whipsaw tracker
                 if net_pnl > 0:
@@ -3529,19 +3744,19 @@ class TradingBot:
                 if len(recent_outcomes) > 5:
                     recent_outcomes.pop(0)
 
-                # Update consecutive SL tracker
+                # V9 S4: Per-regime consecutive SL tracker
                 is_sl = exit_reason in ("stop_loss", "spread_sl")
                 if is_sl:
                     same_day_sl_count += 1
-                    if direction == consec_sl_direction:
-                        consec_sl_count += 1
-                    else:
-                        consec_sl_direction = direction
-                        consec_sl_count = 1
+                    if regime not in consec_sl_by_regime:
+                        consec_sl_by_regime[regime] = {"CE": 0, "PE": 0}
+                    consec_sl_by_regime[regime][direction] += 1
+                    if consec_sl_by_regime[regime][direction] >= 3:
+                        consec_sl_block_by_regime[f"{regime}_{direction}"] = 2  # 2-day block
                 else:
-                    consec_sl_count = 0
-                    consec_sl_direction = ""
-                    consec_sl_block_days = 0
+                    # Reset on non-SL exit for this regime+direction
+                    if regime in consec_sl_by_regime:
+                        consec_sl_by_regime[regime][direction] = 0
 
                 # ── Record trade ──
                 if is_plus and trade_type == "DEBIT_SPREAD" and leg2_data is not None:
@@ -3633,6 +3848,7 @@ class TradingBot:
 
                 cash += net_pnl
                 day_pnl += net_pnl
+                weekly_pnl += net_pnl  # V9 R3
                 day_trades += 1
 
                 full_trades_today += 1
@@ -3647,7 +3863,7 @@ class TradingBot:
                 if daily_loss_abs >= cb_daily_loss_halt:
                     break  # ₹10K daily loss → halt
                 elif daily_loss_abs >= cb_daily_loss_warning:
-                    cb_conviction_boost = 1.0  # ₹5K daily loss → conviction +1.0
+                    cb_conviction_boost = max(cb_conviction_boost, 1.0)  # ₹5K daily loss → conviction +1.0
                 # Active mode: 2 same-day SLs → halt for the day
                 if bt_active and same_day_sl_count >= 2:
                     break
@@ -3987,7 +4203,7 @@ class TradingBot:
             tt_col_w = 16 if is_plus else 10
             print_table("TRADE TYPE PERFORMANCE", ["Type", "Trades", "P&L", "WR", "PF", "Avg Qty"], type_rows, [tt_col_w, 8, 16, 8, 8, 10])
 
-        # ── 11. All Trades Detail (always shown in --full backtest) ──
+        # ── 11. All Trades Detail ──
         if trades:
             trade_rows = []
             running_pnl = 0.0
@@ -4185,9 +4401,9 @@ def main():
     parser = argparse.ArgumentParser(description="VELTRIX — AI Trading Bot")
     parser.add_argument(
         "--mode",
-        choices=["live", "paper", "backtest", "fetch"],
+        choices=["live", "paper", "backtest", "report", "fetch"],
         default="paper",
-        help="Trading mode: live|paper|backtest|fetch (default: paper)",
+        help="Trading mode: live|paper|backtest|report|fetch (default: paper)",
     )
     parser.add_argument(
         "--config",
@@ -4220,12 +4436,6 @@ def main():
         action="store_true",
         help="Active trading mode: 5 trades/day, direction unlocked, lower VOLATILE threshold, 15-min cooldown, 2 SL halt",
     )
-    parser.add_argument(
-        "--full",
-        action="store_true",
-        help="Run full historical backtest (default backtest shows paper trading report)",
-    )
-
     args = parser.parse_args()
 
     # .env loaded automatically by src.config.env_loader at import time
@@ -4246,8 +4456,6 @@ def main():
         bot.options_buyer.set_active_trading(True)
     if args.capital and args.mode == "backtest":
         bot._backtest_capital = args.capital
-    if args.full:
-        bot._full_backtest = True
     bot.run()
 
 

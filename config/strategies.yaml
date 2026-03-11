@@ -87,46 +87,37 @@ ml_predictor:
   model_path: "models/lgbm_latest.pkl"
   scaler_path: "models/scaler_latest.pkl"
   features:
-    # Technical (11)
+    # Core technical (5 — V9.2 kept)
     - "rsi_14"
-    - "macd_histogram"
-    - "bb_position"
-    - "atr_pct"
     - "adx_14"
-    - "volume_ratio"
     - "volatility_20d"
     - "returns_1d"
-    - "returns_5d"
-    - "price_to_sma50"
-    - "mfi_14"
-    # FII/DII (7)
-    - "fii_net_flow_1d"
-    - "fii_net_flow_5d"
-    - "fii_flow_momentum"
-    - "fii_net_direction"
-    - "fii_net_streak"
-    - "dii_net_flow_1d"
-    - "india_vix"
-    # VIX extended (3)
     - "vix_change_pct"
+    # Technical context (8)
+    - "rsi_7"
+    - "macd_histogram"
+    - "macd_line"
+    - "bb_position"
+    - "bb_width"
+    - "atr_pct"
+    - "body_size"
+    - "upper_shadow"
+    # Entry-contemporaneous (6 — V9.2 new)
+    - "india_vix"
     - "vix_percentile_252d"
-    - "vix_5d_ma"
-    # External markets (9)
-    - "sp500_prev_return"
-    - "nasdaq_prev_return"
-    - "crude_prev_return"
-    - "gold_prev_return"
-    - "usdinr_prev_return"
-    - "sp500_nifty_corr_20d"
-    - "crude_nifty_corr_20d"
-    - "dxy_momentum_5d"
-    - "global_risk_score"
-    # Options (4)
-    - "pcr_ratio"
-    - "max_pain_distance"
-    - "delivery_pct"
-    - "futures_premium_pct"
-  max_features: 37
+    - "dist_from_day_open_pct"
+    - "days_to_expiry"
+    - "regime_encoded"
+    - "fii_net_direction"
+    # Momentum/range (3)
+    - "ret_5d"
+    - "ret_20d"
+    - "range_5d_pct"
+    # FII flow (3)
+    - "fii_net_flow_1d"
+    - "fii_flow_momentum"
+    - "fii_net_streak"
+  max_features: 25
   confidence_threshold: 0.62     # Only signal if predict_proba > 0.62
   label:
     up_threshold: 0.005          # +0.5% → class 1

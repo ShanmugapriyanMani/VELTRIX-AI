@@ -163,6 +163,11 @@ class TestCircuitBreaker:
     def setup_method(self):
         self.cb = CircuitBreaker()
 
+    def teardown_method(self):
+        # Clean up state file created by persistence
+        if self.cb._state_file.exists():
+            self.cb._state_file.unlink()
+
     def test_normal_state(self):
         status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
         assert status.state == BreakerState.NORMAL
