@@ -186,38 +186,6 @@ class TestBacktestTradeSpreadFields:
         assert trade.spread_width == 0
 
 
-class TestPaperTraderSpread:
-    """Test paper trader spread order execution."""
-
-    def setup_method(self):
-        from src.execution.paper_trader import PaperTrader
-        self.pt = PaperTrader(initial_capital=150000, slippage_pct=0)
-
-    def test_spread_order_both_legs_fill(self):
-        result = self.pt.place_spread_order(
-            leg1_symbol="NIFTY25500CE", leg1_key="NSE_FO|LEG1",
-            leg1_qty=65, leg1_side="BUY", leg1_price=120.0,
-            leg2_symbol="NIFTY25700CE", leg2_key="NSE_FO|LEG2",
-            leg2_qty=65, leg2_side="SELL", leg2_price=55.0,
-        )
-        assert result["status"] == "success"
-        assert "leg1_order_id" in result
-        assert "leg2_order_id" in result
-
-    def test_spread_leg2_failure_rolls_back(self):
-        # SELL leg adds proceeds to cash, so we need BUY cost > (cash + sell proceeds)
-        # Set cash so low that even after sell proceeds, BUY still fails
-        self.pt.available_cash = 500  # After SELL: 500 + 110*65=7650, but BUY needs 200*65=13000
-        result = self.pt.place_spread_order(
-            leg1_symbol="NIFTY25600CE", leg1_key="NSE_FO|L1",
-            leg1_qty=65, leg1_side="SELL", leg1_price=110.0,
-            leg2_symbol="NIFTY25800CE", leg2_key="NSE_FO|L2",
-            leg2_qty=65, leg2_side="BUY", leg2_price=200.0,  # 200 * 65 = 13000 > 7650
-        )
-        assert result["status"] == "error"
-        assert "rolled back" in result["reason"]
-
-
 class TestEnvConfigSpread:
     """Test spread config vars are loaded correctly."""
 

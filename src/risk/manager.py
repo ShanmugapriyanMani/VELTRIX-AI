@@ -559,10 +559,10 @@ class RiskManager:
         fo_cfg = self.brokerage.get("fo_options", {})
         brokerage = fo_cfg.get("per_order", 20)
 
-        # STT: sell side only, 0.0625%
+        # STT: sell side only, 0.05%
         stt = 0
         if side == "SELL":
-            stt = turnover * 0.000625
+            stt = turnover * 0.0005  # STT rate corrected per SEBI schedule
 
         # Exchange txn charges: 0.05%
         nse_txn = turnover * 0.0005

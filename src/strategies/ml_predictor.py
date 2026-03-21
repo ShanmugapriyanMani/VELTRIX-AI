@@ -98,29 +98,7 @@ class MLPredictorStrategy(BaseStrategy):
         self._load_model()
 
     def _load_model(self) -> bool:
-        """Load saved model and scaler from disk."""
-        if not LIGHTGBM_AVAILABLE:
-            return False
-
-        # V9.2: ML permanently disabled — skip loading stale models
-        from src.config.env_loader import get_config
-        if not get_config().ML_ENABLED:
-            return False
-
-        model_file = Path(self.model_path)
-        scaler_file = Path(self.scaler_path)
-
-        if model_file.exists() and scaler_file.exists():
-            try:
-                with open(model_file, "rb") as f:
-                    self._model = pickle.load(f)
-                with open(scaler_file, "rb") as f:
-                    self._scaler = pickle.load(f)
-                logger.info(f"Loaded ML model from {model_file}")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to load model: {e}")
-
+        """Old LightGBM model permanently superseded by two-stage XGBoost system."""
         return False
 
     def _save_model(self) -> None:

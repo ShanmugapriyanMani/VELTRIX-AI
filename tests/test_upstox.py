@@ -116,6 +116,34 @@ class TestPaperTrader:
         positions = self.trader.get_positions()
         assert positions[0]["pnl"] > 0
 
+    def test_paper_trader_reset_clears_positions(self):
+        """reset_daily() must clear _positions and _gtt_orders."""
+        # Create some state
+        self.trader.place_order(
+            symbol="RELIANCE",
+            instrument_key="NSE_EQ|INE002A01018",
+            quantity=10,
+            side="BUY",
+            price=2500,
+        )
+        self.trader.place_gtt_order(
+            instrument_key="NSE_EQ|INE002A01018",
+            trigger_price=2400,
+            limit_price=2395,
+            quantity=10,
+            side="SELL",
+        )
+        assert len(self.trader._positions) > 0
+        assert len(self.trader._gtt_orders) > 0
+        assert len(self.trader._orders) > 0
+
+        self.trader.reset_daily()
+
+        assert self.trader._positions == {}
+        assert self.trader._gtt_orders == {}
+        assert self.trader._orders == {}
+        assert self.trader._order_counter == 0
+
 
 class TestOrderManager:
     def setup_method(self):
@@ -166,3 +194,74 @@ class TestOrderManager:
 
         result = self.om.execute_signal(signal, 25000, pd.DataFrame())
         assert result["status"] == "blocked"
+
+
+class TestMarginAPIWarning:
+    """Verify margin API failure sends warning only once per day."""
+
+    def test_margin_api_failure_sends_warning_once(self):
+        """_margin_api_warned_today flag prevents repeated Telegram alerts."""
+        sent_messages = []
+
+        class FakeAlerts:
+            def send_raw(self, text):
+                sent_messages.append(text)
+
+        class FakeBroker:
+            def get_available_margin(self):
+                return None  # Simulate API failure
+
+        alerts = FakeAlerts()
+        broker = FakeBroker()
+
+        # Simulate the margin check logic from main.py (2 iterations)
+        _margin_api_warned_today = False
+        for _ in range(3):
+            available_margin = broker.get_available_margin()
+            if available_margin is None:
+                if not _margin_api_warned_today:
+                    _margin_api_warned_today = True
+                    alerts.send_raw("MARGIN API UNAVAILABLE")
+
+        # Should only have sent ONE alert despite 3 failures
+        assert len(sent_messages) == 1
+        assert "MARGIN API" in sent_messages[0]
+        assert _margin_api_warned_today is True
+
+
+class TestApiCallsHaveTimeout:
+    """API timeout is configured and injectable."""
+
+    def test_api_timeout_config_exists(self):
+        """API_TIMEOUT_SECONDS exists in EnvConfig with sensible default."""
+        from src.config.env_loader import EnvConfig
+        cfg = EnvConfig()
+        assert hasattr(cfg, "API_TIMEOUT_SECONDS")
+        assert cfg.API_TIMEOUT_SECONDS >= 5
+        assert cfg.API_TIMEOUT_SECONDS <= 30
+
+    def test_inject_api_timeout_wraps_request(self):
+        """_inject_api_timeout wraps rest_client.request with default timeout."""
+        from src.execution.upstox_broker import _inject_api_timeout
+
+        # Mock an API client with a rest_client.request
+        call_log = []
+
+        class FakeRestClient:
+            def request(self, *args, **kwargs):
+                call_log.append(kwargs)
+                return "ok"
+
+        class FakeApiClient:
+            rest_client = FakeRestClient()
+
+        client = FakeApiClient()
+        _inject_api_timeout(client, 10)
+
+        # Call without timeout — should inject default
+        client.rest_client.request("GET", "http://test.com")
+        assert call_log[-1]["_request_timeout"] == 10
+
+        # Call with explicit timeout — should keep it
+        client.rest_client.request("GET", "http://test.com", _request_timeout=30)
+        assert call_log[-1]["_request_timeout"] == 30

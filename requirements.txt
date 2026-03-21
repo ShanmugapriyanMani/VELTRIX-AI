@@ -16,7 +16,7 @@ upstox-python-sdk>=2.19.0
 # Machine Learning
 lightgbm>=4.1.0
 scikit-learn>=1.3.0
-# xgboost>=2.0.0          # Optional: backtest ensemble
+xgboost>=2.0.0
 # catboost>=1.2.0          # Optional: backtest ensemble
 
 # External Data Sources
@@ -32,6 +32,7 @@ optuna>=3.4.0
 # Dashboard
 streamlit>=1.28.0
 plotly>=5.18.0
+flask>=3.0.0
 
 # Telegram Alerts
 python-telegram-bot>=20.6

@@ -34,6 +34,7 @@ class MarketRegime(str, Enum):
     TRENDING = "TRENDING"
     RANGEBOUND = "RANGEBOUND"
     VOLATILE = "VOLATILE"
+    ELEVATED = "ELEVATED"
 
 
 @dataclass
@@ -117,6 +118,9 @@ class RegimeDetector:
         MarketRegime.VOLATILE: [
             "options_oi", "options_buyer"  # ML unreliable in chaos
         ],
+        MarketRegime.ELEVATED: [
+            "options_oi", "options_buyer"
+        ],
     }
 
     # Regime behavior profiles
@@ -126,7 +130,7 @@ class RegimeDetector:
             "size_multiplier": 1.0,
             "conviction_min": 1.75,         # V8: lowered from 2.0 for more trades
             "sl_multiplier": 1.0,           # Standard SL
-            "tp_multiplier": 1.3,           # Let winners run (+30% wider TP)
+            "tp_multiplier": 1.30,          # Let winners run (+30% wider TP)
             "trailing_stop_enabled": True,   # Trail profits
             "ema_weight": 2.5,              # Trust trend signals
             "mean_reversion_weight": 1.5,   # Standard
@@ -153,6 +157,17 @@ class RegimeDetector:
             "ema_weight": 0.5,              # EMAs lag in chaos
             "mean_reversion_weight": 1.0,   # Standard
             "max_trades_per_day": 1,
+        },
+        MarketRegime.ELEVATED: {
+            # "VIX 20-28 and rising — cautious but active"
+            "size_multiplier": 0.85,        # Slightly reduced
+            "conviction_min": 2.2,          # Higher bar than trending
+            "sl_multiplier": 1.10,          # Slightly wider SL
+            "tp_multiplier": 1.20,          # Slightly wider TP
+            "trailing_stop_enabled": True,
+            "ema_weight": 1.5,              # Moderate trust in trend
+            "mean_reversion_weight": 1.5,   # Standard
+            "max_trades_per_day": 2,
         },
     }
 
@@ -184,6 +199,8 @@ class RegimeDetector:
             self._profiles[MarketRegime.RANGEBOUND]["conviction_min"] = cfg.RANGEBOUND_THRESHOLD
         if _env_is_set("VOLATILE_THRESHOLD"):
             self._profiles[MarketRegime.VOLATILE]["conviction_min"] = cfg.VOLATILE_THRESHOLD
+        if _env_is_set("ELEVATED_THRESHOLD"):
+            self._profiles[MarketRegime.ELEVATED]["conviction_min"] = cfg.ELEVATED_THRESHOLD
 
         self._last_regime: Optional[RegimeState] = None
         self._last_change_time: Optional[datetime] = None
@@ -259,15 +276,21 @@ class RegimeDetector:
         )
 
         # ── Upgrade-only enforcement after morning session ──
-        # After 11:00, regime can only UPGRADE to VOLATILE (never downgrade).
-        # This prevents whipsawing between TRENDING/RANGEBOUND during the day.
+        # After 11:00, regime can only UPGRADE (never downgrade).
+        # Severity order: VOLATILE > ELEVATED > TRENDING/RANGEBOUND
+        _severity = {
+            MarketRegime.RANGEBOUND: 0, MarketRegime.TRENDING: 0,
+            MarketRegime.ELEVATED: 1, MarketRegime.VOLATILE: 2,
+        }
         if self._last_regime and now.hour >= 11:
             prev = self._last_regime.regime
-            if prev == MarketRegime.VOLATILE and regime != MarketRegime.VOLATILE:
-                # Once VOLATILE, stay VOLATILE for the day
-                regime = MarketRegime.VOLATILE
-                notes += " [VOLATILE locked]"
-            elif prev != MarketRegime.VOLATILE and regime != MarketRegime.VOLATILE and regime != prev:
+            prev_sev = _severity.get(prev, 0)
+            new_sev = _severity.get(regime, 0)
+            if new_sev < prev_sev:
+                # Cannot downgrade after 11:00
+                regime = prev
+                notes += f" [{prev.value} locked]"
+            elif prev_sev == 0 and new_sev == 0 and regime != prev:
                 # After 11:00, don't switch between TRENDING↔RANGEBOUND
                 regime = prev
                 notes += " [regime locked after 11:00]"
@@ -368,6 +391,12 @@ class RegimeDetector:
             notes_parts.append(f"ADX={adx:.1f}")
             conf = min(0.5 + volatile_score * 0.15, 0.95)
             return MarketRegime.VOLATILE, conf, " | ".join(notes_parts)
+
+        # ── ELEVATED — VIX 20-28 and rising ──
+        if 20 <= vix <= 28 and vix_5d_change > 0:
+            notes_parts.append(f"VIX={vix:.1f} ELEVATED (20-28, rising +{vix_5d_change:.1f})")
+            notes_parts.append(f"ADX={adx:.1f}")
+            return MarketRegime.ELEVATED, 0.75, " | ".join(notes_parts)
 
         # ── TRENDING — clear directional move ──
         trending_score = 0

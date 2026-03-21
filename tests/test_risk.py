@@ -3,7 +3,7 @@
 import pandas as pd
 
 from src.risk.manager import RiskManager
-from src.risk.portfolio import PortfolioManager, Position
+from src.risk.portfolio import PortfolioManager, Position, compute_kelly_fraction
 from src.risk.circuit_breaker import CircuitBreaker, BreakerState
 
 
@@ -159,9 +159,86 @@ class TestPortfolioManager:
         assert snapshot["total_value"] == 25000
 
 
+class TestTradeRecordDBFields:
+    """Verify close_position returns all fields needed by store.save_trade()."""
+
+    def setup_method(self):
+        self.pm = PortfolioManager(initial_capital=100000)
+
+    def test_save_trade_populates_all_price_fields(self):
+        """close_position must return DB-compatible keys so save_trade writes non-zero values."""
+        pos = Position(
+            symbol="NIFTY2560524200CE",
+            instrument_key="NSE_FO|NIFTY2560524200CE",
+            side="BUY",
+            quantity=65,
+            entry_price=120.0,
+            current_price=150.0,
+            stop_loss=90.0,
+            take_profit=180.0,
+            strategy="options_buyer",
+            trade_id="T_20260317_001",
+            order_id="ORD_123",
+        )
+        self.pm.add_position(pos)
+        result = self.pm.close_position("NIFTY2560524200CE", 150.0, "take_profit")
+
+        assert result is not None
+        # DB-compatible keys must be present and non-zero
+        assert result["price"] == 120.0, "price (entry) must match entry_price"
+        assert result["fill_price"] == 150.0, "fill_price (exit) must match exit_price"
+        assert result["stop_loss"] == 90.0, "stop_loss must be preserved"
+        assert result["take_profit"] == 180.0, "take_profit must be preserved"
+        assert result["instrument_key"] == "NSE_FO|NIFTY2560524200CE"
+        assert result["order_id"] == "ORD_123"
+        assert result["status"] == "closed"
+        assert result["hold_duration_hours"] >= 0
+        assert result["notes"] == "take_profit"
+        assert result["total_charges"] == 0
+        # Original keys still present for backward compat
+        assert result["entry_price"] == 120.0
+        assert result["exit_price"] == 150.0
+        assert result["pnl"] == (150.0 - 120.0) * 65
+
+    def test_partial_close_populates_all_price_fields(self):
+        """partial_close_position must also return DB-compatible keys."""
+        pos = Position(
+            symbol="NIFTY2560524200PE",
+            instrument_key="NSE_FO|NIFTY2560524200PE",
+            side="BUY",
+            quantity=130,
+            entry_price=80.0,
+            current_price=100.0,
+            stop_loss=60.0,
+            take_profit=120.0,
+            strategy="options_buyer",
+            trade_id="T_20260317_002",
+            order_id="ORD_456",
+        )
+        self.pm.add_position(pos)
+        result = self.pm.partial_close_position(
+            "NIFTY2560524200PE", 100.0, 65, "tp1_partial"
+        )
+
+        assert result is not None
+        assert result["price"] == 80.0
+        assert result["fill_price"] == 100.0
+        assert result["stop_loss"] == 60.0
+        assert result["take_profit"] == 120.0
+        assert result["instrument_key"] == "NSE_FO|NIFTY2560524200PE"
+        assert result["order_id"] == "ORD_456"
+        assert result["status"] == "closed"
+        assert result["notes"] == "tp1_partial"
+        assert result["quantity"] == 65
+        assert result["pnl"] == (100.0 - 80.0) * 65
+
+
 class TestCircuitBreaker:
+
     def setup_method(self):
         self.cb = CircuitBreaker()
+        # Ensure clean state (state file may have stale data from previous test)
+        self.cb.reset_daily()
 
     def teardown_method(self):
         # Clean up state file created by persistence
@@ -173,75 +250,161 @@ class TestCircuitBreaker:
         assert status.state == BreakerState.NORMAL
         assert self.cb.can_trade()
 
-    def test_daily_loss_warning(self):
-        """10% daily loss → WARNING. V2.2: conviction boost, NOT size reduction."""
-        status = self.cb.check(daily_loss_pct=12.0, drawdown_pct=5.0, open_positions=3)
-        assert status.state == BreakerState.WARNING
-        # V2.2: WARNING uses conviction boost instead of size multiplier
-        assert self.cb.get_conviction_boost() == 1.0
-        # Size multiplier stays at 1.0 in WARNING (no longer 0.5)
-        assert self.cb.get_size_multiplier() == 1.0
+    def test_two_consecutive_sl_halts_day(self):
+        """Rule 1: 2 consecutive SL exits halt trading for the day."""
+        self.cb.record_trade(-5000)  # SL 1
+        assert self.cb.can_trade()  # Still OK after 1 SL
+        assert self.cb._consecutive_sl == 1
 
-    def test_daily_loss_halt(self):
-        """20% daily loss → HALT trading."""
-        status = self.cb.check(daily_loss_pct=22.0, drawdown_pct=5.0, open_positions=3)
-        assert status.state == BreakerState.HALTED
+        self.cb.record_trade(-5000)  # SL 2
+        assert not self.cb.can_trade()  # Halted
+        assert self.cb._state == BreakerState.HALTED
+        assert self.cb._halt_reason == "consecutive_losses"
+
+    def test_daily_loss_limit_halts_day(self):
+        """Rule 2: Daily loss > ₹20,000 halts trading for the day."""
+        # Use win-loss-win-loss pattern to avoid triggering Rule 1 (consecutive SL)
+        self.cb.record_trade(-15000)  # Loss 1
+        assert self.cb.can_trade()
+        self.cb.record_trade(100)     # Win — resets consecutive SL counter
+        self.cb.record_trade(-6000)   # Loss 2, total: -₹20,900 > ₹20K
+        assert not self.cb.can_trade()
+        assert self.cb._state == BreakerState.HALTED
+        assert self.cb._halt_reason == "daily_loss"
+
+    def test_daily_reset_clears_halt(self):
+        """Daily reset always clears halt — no carry-over."""
+        # Trigger halt via consecutive SL
+        self.cb.record_trade(-5000)
+        self.cb.record_trade(-5000)
         assert not self.cb.can_trade()
 
-    def test_drawdown_warning(self):
-        """15% drawdown → WARNING. V2.2: conviction boost, NOT size reduction."""
-        status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=16.0, open_positions=3)
-        assert status.state == BreakerState.WARNING
-        # V2.2: WARNING uses conviction boost instead of size multiplier
-        assert self.cb.get_conviction_boost() == 1.0
+        # Daily reset clears everything
+        self.cb.reset_daily()
+        assert self.cb.can_trade()
+        assert self.cb._state == BreakerState.NORMAL
+        assert self.cb._consecutive_sl == 0
+        assert self.cb._daily_pnl == 0.0
+        assert self.cb._halt_reason == ""
+
+    def test_consecutive_sl_resets_on_win(self):
+        """A win resets the consecutive SL counter."""
+        self.cb.record_trade(-5000)  # SL 1
+        assert self.cb._consecutive_sl == 1
+
+        self.cb.record_trade(3000)  # Win
+        assert self.cb._consecutive_sl == 0
+        assert self.cb.can_trade()
+
+        # Need 2 more SLs to halt again
+        self.cb.record_trade(-5000)  # SL 1 (fresh)
+        assert self.cb.can_trade()
+
+    def test_size_multiplier_reduces_after_sl(self):
+        """Size multiplier reduces after consecutive SL hits."""
+        # 0 losses → full size
         assert self.cb.get_size_multiplier() == 1.0
 
-    def test_drawdown_critical_halt(self):
-        """22% drawdown → HALT."""
-        status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=23.0, open_positions=3)
-        assert status.state == BreakerState.HALTED
+        # 1 loss → 75% size
+        self.cb.record_trade(-5000)
+        assert self.cb.get_size_multiplier() == 0.75
 
-    def test_consecutive_losses_pause(self):
-        """4 consecutive losses → PAUSE 1 hour (config: pause_threshold=4)."""
-        for _ in range(4):
-            self.cb.record_trade(-100)
+        # 2 losses → halted → 0.0
+        self.cb.record_trade(-5000)
+        assert self.cb.get_size_multiplier() == 0.0
 
-        status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
-        assert status.state == BreakerState.PAUSED
+    def test_size_multiplier_resets_after_win(self):
+        """Size multiplier resets to 1.0 after a win."""
+        self.cb.record_trade(-5000)  # 1 SL
+        assert self.cb.get_size_multiplier() == 0.75
 
-    def test_consecutive_losses_halt(self):
-        """7 consecutive losses → HALT (config: halt_threshold=7)."""
-        for _ in range(7):
-            self.cb.record_trade(-100)
+        self.cb.record_trade(3000)  # Win → reset
+        assert self.cb.get_size_multiplier() == 1.0
 
-        status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
-        assert status.state == BreakerState.HALTED
+    def test_equity_mult_full_size_near_peak(self):
+        """Equity multiplier stays 1.0 when near peak."""
+        self.cb.update_equity(150000)  # Set peak
+        self.cb.update_equity(148000)  # 1.3% drawdown (<5%)
+        assert self.cb.equity_size_multiplier == 1.0
 
-    def test_consecutive_losses_reset_on_win(self):
-        for _ in range(3):
-            self.cb.record_trade(-100)
-        self.cb.record_trade(200)  # Win resets streak
+    def test_equity_mult_reduces_at_10pct_drawdown(self):
+        """Equity multiplier drops through tiers as drawdown increases."""
+        self.cb.update_equity(150000)  # Set peak
+        # 7% drawdown → 0.85
+        self.cb.update_equity(139500)
+        assert self.cb.equity_size_multiplier == 0.85
+        # 12% drawdown → 0.70
+        self.cb.update_equity(132000)
+        assert self.cb.equity_size_multiplier == 0.70
+        # 20% drawdown → 0.50
+        self.cb.update_equity(120000)
+        assert self.cb.equity_size_multiplier == 0.50
 
-        status = self.cb.check(daily_loss_pct=1.0, drawdown_pct=5.0, open_positions=3)
-        assert status.state == BreakerState.NORMAL
+    def test_equity_mult_combines_with_cb_mult(self):
+        """Combined multiplier is min of CB and equity multipliers."""
+        # CB at 0.75 (1 SL), equity at 1.0 → combined = 0.75
+        self.cb.record_trade(-5000)
+        self.cb.update_equity(150000)
+        assert min(self.cb.get_size_multiplier(), self.cb.equity_size_multiplier) == 0.75
+
+        # CB at 0.75 (1 SL), equity at 0.50 (20% DD) → combined = 0.50
+        self.cb.update_equity(120000)
+        assert min(self.cb.get_size_multiplier(), self.cb.equity_size_multiplier) == 0.50
+
+    def test_conviction_boost_always_zero(self):
+        """No conviction boost — removed with simplified CB."""
+        assert self.cb.get_conviction_boost() == 0.0
 
     def test_kill_switch(self):
         result = self.cb.activate_kill_switch()
         assert result["action"] == "cancel_all_flatten"
         assert not self.cb.can_trade()
 
-    def test_daily_reset(self):
-        self.cb.check(daily_loss_pct=22.0, drawdown_pct=5.0, open_positions=0)
-        assert not self.cb.can_trade()
+    def test_record_order_always_true(self):
+        """No order rate limiting — always returns True."""
+        for _ in range(20):
+            assert self.cb.record_order() is True
 
-        self.cb.reset_daily()
-        assert self.cb.can_trade()
 
-    def test_runaway_order_detection(self):
-        """More than 10 orders in 1 minute → HALT."""
-        for _ in range(11):
-            self.cb.record_order()
+class TestKellyFraction:
+    """Quant Phase 2: Dynamic Kelly Sizing."""
 
-        assert not self.cb.can_trade()
-        assert self.cb._state == BreakerState.HALTED
-        assert "Runaway" in self.cb._halt_reason
+    def test_kelly_fraction_computed_correctly(self):
+        """Known trade history → correct half-Kelly multiplier."""
+        # 15 wins of +3000, 5 losses of -5000
+        # WR = 0.75, avg_win = 3000, avg_loss = 5000
+        # payoff = 3000/5000 = 0.6
+        # kelly = 0.75 - 0.25/0.6 = 0.75 - 0.4167 = 0.3333
+        # half_kelly = 0.1667
+        # multiplier = 0.1667 / 0.30 = 0.556
+        pnl = [3000] * 15 + [-5000] * 5
+        result = compute_kelly_fraction(pnl, window=20, min_trades=10)
+        assert 0.50 <= result <= 0.60, f"Expected ~0.56, got {result:.3f}"
+
+        # 18 wins of +5000, 2 losses of -3000
+        # WR = 0.90, avg_win = 5000, avg_loss = 3000
+        # payoff = 5000/3000 = 1.667
+        # kelly = 0.90 - 0.10/1.667 = 0.90 - 0.060 = 0.840
+        # half_kelly = 0.420
+        # multiplier = 0.420 / 0.30 = 1.40
+        pnl2 = [5000] * 18 + [-3000] * 2
+        result2 = compute_kelly_fraction(pnl2, window=20, min_trades=10)
+        assert 1.35 <= result2 <= 1.45, f"Expected ~1.40, got {result2:.3f}"
+
+        # Capped at max_mult
+        result3 = compute_kelly_fraction(pnl2, window=20, min_trades=10, max_mult=1.20)
+        assert result3 == 1.20
+
+    def test_kelly_returns_full_size_insufficient_data(self):
+        """With <min_trades data, Kelly returns 1.0 (full size)."""
+        # Less than 10 trades → 1.0
+        assert compute_kelly_fraction([1000, -500, 2000], min_trades=10) == 1.0
+
+        # All wins → 1.0
+        assert compute_kelly_fraction([1000] * 20) == 1.0
+
+        # All losses → 1.0
+        assert compute_kelly_fraction([-1000] * 20) == 1.0
+
+        # Empty → 1.0
+        assert compute_kelly_fraction([]) == 1.0

@@ -1,396 +1,225 @@
 """
-Circuit Breaker System — Emergency risk controls (V2.2).
+Circuit Breaker System — Simplified V3.
 
-Levels:
-1. NORMAL  — all trading active
-2. WARNING — daily loss >3% OR drawdown >15% → conviction +1.0 (stricter entry)
-3. PAUSED  — 4 consecutive losses → pause 1 hour
-4. HALTED  — daily loss >5% OR drawdown >18% OR 7 consec losses → no new trades
-5. KILLED  — emergency kill switch, cancel all + flatten
+Only 2 rules:
+1. 2 consecutive SL exits → halt rest of day
+2. Daily loss > ₹20,000 → halt rest of day
 
-Weekly/monthly tiers:
-- Weekly loss ≥8% → half lot rest of week
-- Monthly loss ≥12% → pause 3 days
+State machine:
+  NORMAL → trading allowed
+  HALTED → no new entries today (exits/monitoring still run)
 
-Also enforces:
-- Max 10 orders/minute (runaway detection → emergency halt)
-- Max 2 trades/day, 20 orders/day
+Daily reset every morning clears everything — no weekly/monthly carry-over.
 """
 
 from __future__ import annotations
 
 import json
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-import yaml
 from loguru import logger
 
-from src.config.env_loader import get_config, _env_is_set
+from src.config.env_loader import get_config
 
 
 class BreakerState(str, Enum):
     NORMAL = "NORMAL"
-    WARNING = "WARNING"
-    PAUSED = "PAUSED"
     HALTED = "HALTED"
-    KILLED = "KILLED"
 
 
 @dataclass
 class BreakerStatus:
-    """Current state of all circuit breakers."""
+    """Current state of circuit breaker."""
 
     state: BreakerState = BreakerState.NORMAL
-    daily_loss_pct: float = 0.0
-    drawdown_pct: float = 0.0
-    consecutive_losses: int = 0
+    consecutive_sl: int = 0
+    daily_pnl: float = 0.0
     daily_trades: int = 0
-    daily_orders: int = 0
-    open_positions: int = 0
-    pause_until: Optional[datetime] = None
     halt_reason: str = ""
-    weekly_pnl: float = 0.0
-    monthly_pnl: float = 0.0
-    weekly_size_reduced: bool = False
     timestamp: datetime = field(default_factory=datetime.now)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
-            "daily_loss_pct": round(self.daily_loss_pct, 2),
-            "drawdown_pct": round(self.drawdown_pct, 2),
-            "consecutive_losses": self.consecutive_losses,
+            "consecutive_sl": self.consecutive_sl,
+            "daily_pnl": round(self.daily_pnl, 2),
             "daily_trades": self.daily_trades,
-            "daily_orders": self.daily_orders,
-            "open_positions": self.open_positions,
-            "pause_until": self.pause_until.isoformat() if self.pause_until else None,
             "halt_reason": self.halt_reason,
-            "weekly_pnl": round(self.weekly_pnl, 2),
-            "monthly_pnl": round(self.monthly_pnl, 2),
-            "weekly_size_reduced": self.weekly_size_reduced,
-            "can_trade": self.state in (BreakerState.NORMAL, BreakerState.WARNING),
+            "can_trade": self.state == BreakerState.NORMAL,
         }
 
 
 class CircuitBreaker:
     """
-    Multi-level circuit breaker system (V2.2).
+    Simplified circuit breaker — 2 rules only.
 
-    Levels:
-    1. NORMAL  — all trading active
-    2. WARNING — daily loss >3% OR drawdown >15%, conviction +1.0
-    3. PAUSED  — 4 consecutive losses, pause 1 hour
-    4. HALTED  — daily loss >5% OR drawdown >18%, no new trades
-    5. KILLED  — emergency kill switch, cancel all + flatten
+    Rule 1: 2 consecutive SL exits → HALTED rest of day
+    Rule 2: Daily loss > ₹20,000 → HALTED rest of day
+
+    Daily reset every morning clears all state.
     """
 
     def __init__(self, config_path: str = "config/risk.yaml"):
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-
-        cb_cfg = config.get("circuit_breakers", {})
-
-        # Daily loss — two-tier: warning (reduce size) then halt
-        daily_cfg = cb_cfg.get("daily_loss", {})
-        self.daily_loss_warning = daily_cfg.get("warning_pct", 3.0)
-        self.daily_loss_threshold = daily_cfg.get("threshold_pct", 5.0)
-
-        # Drawdown
-        dd_cfg = cb_cfg.get("drawdown", {})
-        self.drawdown_warning = dd_cfg.get("warning_pct", 15.0)
-        self.drawdown_critical = dd_cfg.get("critical_pct", 22.0)
-
-        # Consecutive losses
-        cl_cfg = cb_cfg.get("consecutive_losses", {})
-        self.pause_threshold = cl_cfg.get("pause_threshold", 6)
-        self.halt_threshold = cl_cfg.get("halt_threshold", 10)
-        self.pause_duration_min = cl_cfg.get("pause_duration_minutes", 60)
-
-        # Limits
-        self.max_daily_trades = cb_cfg.get("max_daily_trades", 20)
-        self.max_daily_orders = cb_cfg.get("max_daily_orders", 50)
-        self.max_open_positions = cb_cfg.get("max_open_positions", 10)
-        self.max_orders_per_minute = cb_cfg.get("max_orders_per_minute", 10)
-
-        # EnvConfig overlay
         cfg = get_config()
-        if _env_is_set("MAX_TRADES_PER_DAY"):
-            self.max_daily_trades = cfg.MAX_TRADES_PER_DAY
+        self._daily_loss_limit = cfg.DAILY_LOSS_HALT  # ₹20,000 from .env.plus
+        self._consec_sl_limit = 2
 
-        # Weekly/monthly loss tiers
-        wl_cfg = cb_cfg.get("weekly_loss", {})
-        self.weekly_loss_warning = wl_cfg.get("warning_pct", 8.0)
-        ml_cfg = cb_cfg.get("monthly_loss", {})
-        self.monthly_loss_warning = ml_cfg.get("warning_pct", 12.0)
-        self.monthly_pause_days = ml_cfg.get("pause_days", 3)
-
-        # Kill switch
-        ks_cfg = cb_cfg.get("kill_switch", {})
-        self.kill_switch_enabled = ks_cfg.get("enabled", True)
-
-        # State tracking
+        # State
         self._state = BreakerState.NORMAL
-        self._consecutive_losses = 0
-        self._daily_trades = 0
-        self._daily_orders = 0
-        self._pause_until: Optional[datetime] = None
         self._halt_reason = ""
+        self._consecutive_sl = 0
         self._daily_pnl = 0.0
-        self._weekly_pnl = 0.0
-        self._monthly_pnl = 0.0
+        self._daily_trades = 0
         self._last_reset_date: Optional[date] = None
-        self._week_start_date: Optional[date] = None
-        self._month_start_date: Optional[date] = None
-        self._weekly_size_reduced = False
-        self._monthly_paused_until: Optional[date] = None
-        self._alerts_sent: set[str] = set()
+        self._alert_fn: Optional[Callable[[str], None]] = None
 
-        # Per-minute order tracking (sliding window)
-        self._order_timestamps: deque[float] = deque()
+        # Equity curve sizing (carries across days — never resets)
+        self._peak_equity: float = 0.0
+        self._current_equity: float = 0.0
 
-        # Persistence: restore weekly/monthly state across restarts
+        # Persistence (daily only — for crash recovery within same day)
         self._state_file = Path(__file__).resolve().parent.parent.parent / "data" / "circuit_breaker_state.json"
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_state()
 
+    def set_alert_fn(self, fn: Callable[[str], None]) -> None:
+        """Inject Telegram alert function."""
+        self._alert_fn = fn
+
+    def _send_alert(self, message: str) -> None:
+        """Send alert via injected function if available."""
+        if self._alert_fn:
+            try:
+                self._alert_fn(message)
+            except Exception:
+                pass
+
     def check(
         self,
-        daily_loss_pct: float,
-        drawdown_pct: float,
-        open_positions: int,
+        daily_loss_pct: float = 0.0,
+        drawdown_pct: float = 0.0,
+        open_positions: int = 0,
     ) -> BreakerStatus:
         """
-        Run all circuit breaker checks.
+        Run circuit breaker checks. Accepts legacy args for compatibility.
 
-        Args:
-            daily_loss_pct: Today's loss as % of capital (positive = loss)
-            drawdown_pct: Current drawdown from peak (positive)
-            open_positions: Number of open positions
-
-        Returns:
-            BreakerStatus with current state
+        The actual checks happen in record_trade() — this just ensures
+        daily reset and returns current status.
         """
         self._reset_daily_if_new_day()
-        self._reset_weekly_if_new_week()
-        self._reset_monthly_if_new_month()
-
-        now = datetime.now()
-        today = now.date()
-
-        # ── Monthly pause check ──
-        if self._monthly_paused_until and today < self._monthly_paused_until:
-            if self._state not in (BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.PAUSED
-                self._halt_reason = (
-                    f"Monthly loss pause until {self._monthly_paused_until.isoformat()}"
-                )
-                return self._get_status(daily_loss_pct, drawdown_pct, open_positions)
-        elif self._monthly_paused_until and today >= self._monthly_paused_until:
-            self._monthly_paused_until = None
-            if self._state == BreakerState.PAUSED:
-                self._state = BreakerState.NORMAL
-                logger.info("CIRCUIT BREAKER: Monthly pause expired, resuming NORMAL")
-
-        # ── Check pause expiry ──
-        if self._state == BreakerState.PAUSED and self._pause_until:
-            if now >= self._pause_until:
-                self._state = BreakerState.NORMAL
-                self._pause_until = None
-                logger.info("CIRCUIT BREAKER: Pause expired, resuming NORMAL state")
-
-        # If KILLED, stay killed until manual reset
-        if self._state == BreakerState.KILLED:
-            return self._get_status(daily_loss_pct, drawdown_pct, open_positions)
-
-        # ── Check 1: Daily loss HALT (5%) ──
-        if daily_loss_pct >= self.daily_loss_threshold:
-            if self._state != BreakerState.HALTED:
-                self._state = BreakerState.HALTED
-                self._halt_reason = f"Daily loss {daily_loss_pct:.1f}% >= {self.daily_loss_threshold}%"
-                logger.critical(f"CIRCUIT BREAKER: HALTED — {self._halt_reason}")
-
-        # ── Check 2: Drawdown HALT (22%) ──
-        elif drawdown_pct >= self.drawdown_critical:
-            if self._state not in (BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.HALTED
-                self._halt_reason = f"Drawdown {drawdown_pct:.1f}% >= {self.drawdown_critical}%"
-                logger.critical(f"CIRCUIT BREAKER: HALTED — {self._halt_reason}")
-
-        # ── Check 3: Daily loss WARNING (3%) or Drawdown WARNING (15%) ──
-        elif daily_loss_pct >= self.daily_loss_warning or drawdown_pct >= self.drawdown_warning:
-            if self._state == BreakerState.NORMAL:
-                self._state = BreakerState.WARNING
-                reasons = []
-                if daily_loss_pct >= self.daily_loss_warning:
-                    reasons.append(f"Daily loss {daily_loss_pct:.1f}% >= {self.daily_loss_warning}%")
-                if drawdown_pct >= self.drawdown_warning:
-                    reasons.append(f"Drawdown {drawdown_pct:.1f}% >= {self.drawdown_warning}%")
-                logger.warning(
-                    f"CIRCUIT BREAKER: WARNING — {'; '.join(reasons)}. Conviction +1.0 required."
-                )
-
-        # ── Check 4: Consecutive losses ──
-        elif self._consecutive_losses >= self.halt_threshold:
-            if self._state not in (BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.HALTED
-                self._halt_reason = f"{self._consecutive_losses} consecutive losses"
-                logger.critical(f"CIRCUIT BREAKER: HALTED — {self._halt_reason}")
-
-        elif self._consecutive_losses >= self.pause_threshold:
-            if self._state not in (BreakerState.PAUSED, BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.PAUSED
-                self._pause_until = now + timedelta(minutes=self.pause_duration_min)
-                logger.warning(
-                    f"CIRCUIT BREAKER: PAUSED for {self.pause_duration_min}min — "
-                    f"{self._consecutive_losses} consecutive losses"
-                )
-
-        # ── Check 5: Daily trade limit ──
-        elif self._daily_trades >= self.max_daily_trades:
-            if self._state not in (BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.HALTED
-                self._halt_reason = f"Max daily trades ({self.max_daily_trades}) reached"
-                logger.warning(f"CIRCUIT BREAKER: HALTED — {self._halt_reason}")
-
-        else:
-            # Clear warnings if conditions improve
-            if self._state == BreakerState.WARNING:
-                if daily_loss_pct < self.daily_loss_warning and drawdown_pct < self.drawdown_warning:
-                    self._state = BreakerState.NORMAL
-                    logger.info("CIRCUIT BREAKER: Conditions improved, back to NORMAL")
-
-        return self._get_status(daily_loss_pct, drawdown_pct, open_positions)
+        return self._get_status()
 
     def record_trade(self, pnl: float, capital: float = 0) -> None:
-        """Record a trade result for consecutive loss and weekly/monthly tracking."""
-        if capital <= 0:
-            capital = get_config().TRADING_CAPITAL
+        """Record a trade result. Checks both rules after each trade."""
         self._daily_trades += 1
-
-        if pnl < 0:
-            self._consecutive_losses += 1
-        else:
-            self._consecutive_losses = 0  # Reset on win
-
         self._daily_pnl += pnl
-        self._weekly_pnl += pnl
-        self._monthly_pnl += pnl
 
-        # ── Weekly loss tier: ≥8% → half lot rest of week ──
-        if capital > 0 and not self._weekly_size_reduced:
-            weekly_loss_pct = abs(min(0, self._weekly_pnl)) / capital * 100
-            if weekly_loss_pct >= self.weekly_loss_warning:
-                self._weekly_size_reduced = True
-                logger.warning(
-                    f"CIRCUIT BREAKER: Weekly loss {weekly_loss_pct:.1f}% >= "
-                    f"{self.weekly_loss_warning}% — half lot rest of week"
-                )
+        # Track consecutive SL: loss = SL hit, win = reset
+        if pnl < 0:
+            self._consecutive_sl += 1
+        else:
+            self._consecutive_sl = 0
 
-        # ── Monthly loss tier: ≥12% → pause N days ──
-        if capital > 0 and self._monthly_paused_until is None:
-            monthly_loss_pct = abs(min(0, self._monthly_pnl)) / capital * 100
-            if monthly_loss_pct >= self.monthly_loss_warning:
-                self._monthly_paused_until = date.today() + timedelta(days=self.monthly_pause_days)
-                self._state = BreakerState.PAUSED
-                self._halt_reason = (
-                    f"Monthly loss {monthly_loss_pct:.1f}% >= {self.monthly_loss_warning}% "
-                    f"— paused until {self._monthly_paused_until.isoformat()}"
-                )
-                logger.critical(f"CIRCUIT BREAKER: {self._halt_reason}")
+        # Rule 1: 2 consecutive SL hits → halt
+        if self._state == BreakerState.NORMAL and self._consecutive_sl >= self._consec_sl_limit:
+            self._state = BreakerState.HALTED
+            self._halt_reason = "consecutive_losses"
+            logger.critical(
+                f"CB_HALT: {self._consec_sl_limit} consecutive SL hits. "
+                f"Halting rest of day."
+            )
+            self._send_alert(
+                f"\U0001f6d1 {self._consec_sl_limit} consecutive losses.\n"
+                f"Halting trading for today.\n"
+                f"Resume tomorrow."
+            )
 
-        # Persist state after every trade
+        # Rule 2: Daily loss > limit → halt
+        daily_loss = abs(min(0, self._daily_pnl))
+        if self._state == BreakerState.NORMAL and daily_loss >= self._daily_loss_limit:
+            self._state = BreakerState.HALTED
+            self._halt_reason = "daily_loss"
+            logger.critical(
+                f"CB_HALT: Daily loss \u20b9{daily_loss:,.0f} "
+                f">= \u20b9{self._daily_loss_limit:,.0f}. Halting rest of day."
+            )
+            self._send_alert(
+                f"\U0001f6d1 Daily loss \u20b9{daily_loss:,.0f}.\n"
+                f"Halting trading for today.\n"
+                f"Resume tomorrow."
+            )
+
         self.save_state()
 
     def record_order(self) -> bool:
-        """
-        Record an order attempt. Returns False if limit reached.
-
-        Also checks per-minute rate: >10 orders/minute triggers emergency halt.
-        """
-        now_ts = datetime.now().timestamp()
-        self._daily_orders += 1
-
-        # Track per-minute sliding window
-        self._order_timestamps.append(now_ts)
-        cutoff = now_ts - 60.0
-        while self._order_timestamps and self._order_timestamps[0] < cutoff:
-            self._order_timestamps.popleft()
-
-        # Runaway detection: too many orders in 1 minute
-        if len(self._order_timestamps) > self.max_orders_per_minute:
-            if self._state not in (BreakerState.HALTED, BreakerState.KILLED):
-                self._state = BreakerState.HALTED
-                self._halt_reason = (
-                    f"Runaway detection: {len(self._order_timestamps)} orders in 1 minute "
-                    f"> limit {self.max_orders_per_minute}"
-                )
-                logger.critical(f"CIRCUIT BREAKER: HALTED — {self._halt_reason}")
-            return False
-
-        if self._daily_orders > self.max_daily_orders:
-            return False
-
+        """Record an order attempt. Returns True (always allowed — no order rate limits)."""
         return True
 
     def can_trade(self) -> bool:
         """Check if trading is currently allowed."""
-        if self._state in (BreakerState.HALTED, BreakerState.KILLED):
-            return False
-        if self._state == BreakerState.PAUSED:
-            if self._pause_until and datetime.now() < self._pause_until:
-                return False
-        if self._daily_trades >= self.max_daily_trades:
-            return False
-        if self._daily_orders >= self.max_daily_orders:
-            return False
-        return True
+        self._reset_daily_if_new_day()
+        return self._state == BreakerState.NORMAL
 
     def get_size_multiplier(self) -> float:
-        """Get position size multiplier based on breaker state.
+        """Loss-based position size reduction.
 
-        V2.2: WARNING no longer reduces size — it adds conviction +1.0 instead.
-        Use get_conviction_boost() for the conviction penalty.
+        0 consecutive SL → 1.0 (full size)
+        1 consecutive SL → 0.75 (75% size)
+        2+ consecutive SL → 0.50 (but halt fires at 2, so effectively 0.0)
+        Resets to 1.0 automatically when consecutive SL resets on any win.
         """
-        if self._state in (BreakerState.PAUSED, BreakerState.HALTED, BreakerState.KILLED):
+        if self._state == BreakerState.HALTED:
             return 0.0
-        # Weekly loss tier: half lot rest of week (still applies)
-        if self._weekly_size_reduced:
-            return 0.5
-        return 1.0
+        if self._consecutive_sl == 0:
+            return 1.0
+        elif self._consecutive_sl == 1:
+            return 0.75
+        else:
+            return 0.50
+
+    def update_equity(self, current_equity: float) -> None:
+        """Update current equity for equity curve sizing."""
+        self._current_equity = current_equity
+        if current_equity > self._peak_equity:
+            self._peak_equity = current_equity
+
+    @property
+    def equity_size_multiplier(self) -> float:
+        """Equity curve position size reduction.
+
+        < 5% from peak  → 1.0 (full size)
+        5-10% from peak  → 0.85
+        10-15% from peak → 0.70
+        15%+ from peak   → 0.50
+
+        Never resets — peak equity carries across days.
+        """
+        if self._peak_equity <= 0:
+            return 1.0
+        drawdown = (self._peak_equity - self._current_equity) / self._peak_equity
+        if drawdown < 0.05:
+            return 1.0
+        elif drawdown < 0.10:
+            return 0.85
+        elif drawdown < 0.15:
+            return 0.70
+        else:
+            return 0.50
 
     def get_conviction_boost(self) -> float:
-        """Get conviction requirement boost based on breaker state.
-
-        V2.2: WARNING state adds +1.0 to conviction threshold instead of
-        reducing position size. This makes the system more selective
-        rather than trading smaller.
-        """
-        if self._state == BreakerState.WARNING:
-            return 1.0
+        """No conviction boost — removed with WARNING state."""
         return 0.0
 
     def activate_kill_switch(self) -> dict[str, Any]:
-        """
-        Emergency kill switch — cancel all orders and flatten all positions.
-
-        Returns instructions for the execution engine.
-        """
-        if not self.kill_switch_enabled:
-            logger.warning("Kill switch is disabled in config")
-            return {"action": "none", "reason": "kill switch disabled"}
-
-        self._state = BreakerState.KILLED
+        """Emergency kill switch — halt and flatten."""
+        self._state = BreakerState.HALTED
         self._halt_reason = "KILL SWITCH ACTIVATED"
-
-        logger.critical(
-            "KILL SWITCH ACTIVATED — Cancelling all orders and flattening positions"
-        )
-
+        logger.critical("KILL SWITCH ACTIVATED — Halting all trading")
+        self._send_alert("\U0001f480 Kill switch activated. Trading halted. Manual reset required.")
         return {
             "action": "cancel_all_flatten",
             "cancel_pending": True,
@@ -401,34 +230,24 @@ class CircuitBreaker:
 
     def reset(self, force: bool = False) -> None:
         """Reset circuit breaker to normal state."""
-        if self._state == BreakerState.KILLED and not force:
-            logger.warning("Cannot reset KILLED state without force=True")
-            return
-
         prev_state = self._state
         self._state = BreakerState.NORMAL
         self._halt_reason = ""
-        self._pause_until = None
-        self._alerts_sent.clear()
-
         logger.info(f"CIRCUIT BREAKER: Reset from {prev_state.value} to NORMAL")
 
     def reset_daily(self) -> None:
-        """Reset daily counters (call at start of trading day)."""
-        self._daily_trades = 0
-        self._daily_orders = 0
+        """Reset daily state for a new trading day. Always resets — no carry-over.
+
+        Note: peak_equity and current_equity are NOT reset — they carry across days.
+        """
+        self._state = BreakerState.NORMAL
+        self._halt_reason = ""
+        self._consecutive_sl = 0
         self._daily_pnl = 0.0
+        self._daily_trades = 0
         self._last_reset_date = date.today()
-        self._order_timestamps.clear()
-
-        # Reset halt if not killed
-        if self._state in (BreakerState.HALTED, BreakerState.PAUSED):
-            self._state = BreakerState.NORMAL
-            self._halt_reason = ""
-            self._pause_until = None
-
-        self._alerts_sent.clear()
-        logger.info("CIRCUIT BREAKER: Daily counters reset")
+        self.save_state()
+        logger.info("CB_RESET: Daily reset — all clear")
 
     def _reset_daily_if_new_day(self) -> None:
         """Auto-reset daily counters on new trading day."""
@@ -436,128 +255,63 @@ class CircuitBreaker:
         if self._last_reset_date != today:
             self.reset_daily()
 
-    def _reset_weekly_if_new_week(self) -> None:
-        """Auto-reset weekly counters on new week (Monday)."""
-        today = date.today()
-        if self._week_start_date is None:
-            self._week_start_date = today - timedelta(days=today.weekday())
-        week_start = today - timedelta(days=today.weekday())
-        if week_start > self._week_start_date:
-            self._weekly_pnl = 0.0
-            self._weekly_size_reduced = False
-            self._week_start_date = week_start
-            logger.info("CIRCUIT BREAKER: Weekly counters reset")
-
-    def _reset_monthly_if_new_month(self) -> None:
-        """Auto-reset monthly counters on new month."""
-        today = date.today()
-        if self._month_start_date is None:
-            self._month_start_date = today.replace(day=1)
-        month_start = today.replace(day=1)
-        if month_start > self._month_start_date:
-            self._monthly_pnl = 0.0
-            self._month_start_date = month_start
-            # Don't clear monthly_paused_until — let it expire naturally
-            logger.info("CIRCUIT BREAKER: Monthly counters reset")
-
-    def _get_status(
-        self,
-        daily_loss_pct: float,
-        drawdown_pct: float,
-        open_positions: int,
-    ) -> BreakerStatus:
+    def _get_status(self) -> BreakerStatus:
         return BreakerStatus(
             state=self._state,
-            daily_loss_pct=daily_loss_pct,
-            drawdown_pct=drawdown_pct,
-            consecutive_losses=self._consecutive_losses,
+            consecutive_sl=self._consecutive_sl,
+            daily_pnl=self._daily_pnl,
             daily_trades=self._daily_trades,
-            daily_orders=self._daily_orders,
-            open_positions=open_positions,
-            pause_until=self._pause_until,
             halt_reason=self._halt_reason,
-            weekly_pnl=self._weekly_pnl,
-            monthly_pnl=self._monthly_pnl,
-            weekly_size_reduced=self._weekly_size_reduced,
         )
 
     @property
     def status(self) -> BreakerStatus:
-        return BreakerStatus(
-            state=self._state,
-            consecutive_losses=self._consecutive_losses,
-            daily_trades=self._daily_trades,
-            daily_orders=self._daily_orders,
-            halt_reason=self._halt_reason,
-            pause_until=self._pause_until,
-            weekly_pnl=self._weekly_pnl,
-            monthly_pnl=self._monthly_pnl,
-            weekly_size_reduced=self._weekly_size_reduced,
-        )
+        return self._get_status()
 
-    # ── State persistence across restarts ──
+    # ── State persistence (same-day crash recovery only) ──
 
     def _load_state(self) -> None:
-        """Load weekly/monthly state from disk on startup."""
+        """Load state from disk on startup (same day only)."""
         try:
             data = json.loads(self._state_file.read_text())
             saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
-            today = date.today()
+            # Always restore peak equity (carries across days)
+            self._peak_equity = data.get("peak_equity", 0.0)
+            self._current_equity = data.get("current_equity", 0.0)
 
-            # Weekly state: valid if same week (same Monday)
-            saved_week_start = saved_date - timedelta(days=saved_date.weekday())
-            current_week_start = today - timedelta(days=today.weekday())
-            if saved_week_start == current_week_start:
-                self._weekly_pnl = data.get("weekly_pnl", 0.0)
-                self._weekly_size_reduced = data.get("weekly_size_reduced", False)
-                self._week_start_date = current_week_start
-                if self._weekly_size_reduced:
-                    logger.warning(
-                        f"CIRCUIT BREAKER: Restored weekly state — "
-                        f"PnL ₹{self._weekly_pnl:,.0f}, half-lot active"
-                    )
-
-            # Monthly state: valid if same month
-            saved_month = (saved_date.year, saved_date.month)
-            current_month = (today.year, today.month)
-            if saved_month == current_month:
-                self._monthly_pnl = data.get("monthly_pnl", 0.0)
-                paused_str = data.get("monthly_paused_until")
-                if paused_str:
-                    paused_date = date.fromisoformat(paused_str)
-                    if paused_date > today:
-                        self._monthly_paused_until = paused_date
-                        self._state = BreakerState.PAUSED
-                        self._halt_reason = f"Monthly pause restored — until {paused_date.isoformat()}"
-                        logger.critical(f"CIRCUIT BREAKER: {self._halt_reason}")
-                self._month_start_date = today.replace(day=1)
-
-            # Consecutive losses persist within same day only
-            if saved_date == today:
-                self._consecutive_losses = data.get("consecutive_losses", 0)
+            if saved_date == date.today():
+                self._consecutive_sl = data.get("consecutive_sl", 0)
                 self._daily_pnl = data.get("daily_pnl", 0.0)
-
-            logger.info(f"CIRCUIT BREAKER: State loaded from {self._state_file}")
+                self._daily_trades = data.get("daily_trades", 0)
+                self._last_reset_date = saved_date
+                # Restore halt state if was halted
+                if data.get("state") == "HALTED":
+                    self._state = BreakerState.HALTED
+                    self._halt_reason = data.get("halt_reason", "")
+                logger.info(f"CIRCUIT BREAKER: State loaded from {self._state_file}")
+            else:
+                # Different day — fresh start (but peak equity preserved above)
+                self._last_reset_date = date.today()
         except FileNotFoundError:
-            pass  # First run — no state file yet
+            pass
         except Exception as e:
             logger.warning(f"CIRCUIT BREAKER: Could not load state: {e}")
 
     def save_state(self) -> None:
-        """Persist weekly/monthly state to disk. Call after each trade."""
+        """Persist state to disk for crash recovery."""
         try:
             data = {
                 "date": date.today().isoformat(),
-                "weekly_pnl": round(self._weekly_pnl, 2),
-                "weekly_size_reduced": self._weekly_size_reduced,
-                "monthly_pnl": round(self._monthly_pnl, 2),
-                "monthly_paused_until": (
-                    self._monthly_paused_until.isoformat()
-                    if self._monthly_paused_until else None
-                ),
-                "consecutive_losses": self._consecutive_losses,
+                "state": self._state.value,
+                "halt_reason": self._halt_reason,
+                "consecutive_sl": self._consecutive_sl,
                 "daily_pnl": round(self._daily_pnl, 2),
+                "daily_trades": self._daily_trades,
+                "peak_equity": round(self._peak_equity, 2),
+                "current_equity": round(self._current_equity, 2),
             }
             self._state_file.write_text(json.dumps(data, indent=2))
+        except PermissionError as e:
+            logger.warning(f"CIRCUIT BREAKER: Read-only filesystem, cannot save state: {e}")
         except Exception as e:
             logger.warning(f"CIRCUIT BREAKER: Could not save state: {e}")

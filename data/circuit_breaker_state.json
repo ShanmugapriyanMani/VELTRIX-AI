@@ -1,9 +1,10 @@
 {
-  "date": "2026-03-11",
-  "weekly_pnl": 27153.75,
-  "weekly_size_reduced": false,
-  "monthly_pnl": 27153.75,
-  "monthly_paused_until": null,
-  "consecutive_losses": 0,
-  "daily_pnl": 27153.75
+  "date": "2026-03-22",
+  "state": "NORMAL",
+  "halt_reason": "",
+  "consecutive_sl": 0,
+  "daily_pnl": 0.0,
+  "daily_trades": 0,
+  "peak_equity": 0.0,
+  "current_equity": 0.0
 }

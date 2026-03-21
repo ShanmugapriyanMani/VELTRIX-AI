@@ -47,6 +47,23 @@ class OrderManager:
         self._gtt_orders: dict[str, dict] = {}
         self._filled_orders: list[dict] = []
 
+        # Alert function (injected by main.py)
+        self._alert_fn: Optional[callable] = None
+        # Spread LTP error tracking (H3)
+        self._spread_ltp_errors: dict[str, int] = {}
+
+    def set_alert_fn(self, fn) -> None:
+        """Inject Telegram alert function."""
+        self._alert_fn = fn
+
+    def reset_daily(self) -> None:
+        """Reset daily state for a new trading day."""
+        self._pending_orders = {}
+        self._gtt_orders = {}
+        self._filled_orders = []
+        self._spread_ltp_errors = {}
+        logger.info("ORDER_MANAGER_RESET: daily state cleared")
+
     def execute_signal(
         self,
         signal: dict[str, Any],
@@ -91,6 +108,8 @@ class OrderManager:
         is_options = features.get("is_options", False) or instrument_key.startswith("NSE_FO|")
 
         if is_options:
+            if features.get("is_iron_condor", False):
+                return self._execute_iron_condor_signal(signal, capital, current_positions)
             if features.get("is_spread", False):
                 return self._execute_spread_signal(signal, capital, current_positions)
             return self._execute_options_signal(signal, capital, current_positions)
@@ -288,8 +307,34 @@ class OrderManager:
 
         order_id = order_result.get("order_id", "")
 
+        # ── Live mode: wait for fill confirmation before proceeding ──
+        fill_price = premium  # Default: signal price (paper mode)
+        if hasattr(self.broker, "wait_for_fill"):
+            fill_result = self.broker.wait_for_fill(order_id, timeout_seconds=60)
+            if not fill_result.get("filled"):
+                reason = fill_result.get("reason", "unknown")
+                logger.warning(
+                    f"ENTRY_FAILED: {symbol} order_id={order_id} reason={reason}"
+                )
+                return {
+                    "status": "rejected",
+                    "reason": f"Order not filled: {reason}",
+                    "order_id": order_id,
+                }
+            # Use actual fill price from broker
+            if fill_result.get("avg_price", 0) > 0:
+                fill_price = fill_result["avg_price"]
+                if fill_result.get("filled_qty", 0) > 0:
+                    quantity = fill_result["filled_qty"]
+            slippage_pct = abs(fill_price - premium) / premium if premium > 0 else 0
+            logger.info(
+                f"FILL_CONFIRMED: {symbol} signal=₹{premium:.2f} fill=₹{fill_price:.2f} "
+                f"slippage={slippage_pct:.3%}"
+            )
+
         # ── Place GTT SL and TP (use SL-LIMIT for options, not SL-M) ──
         gtt_results = {}
+        gtt_failed = False
         if stop_loss > 0:
             sl_result = self.broker.place_gtt_order(
                 instrument_key=instrument_key,
@@ -299,6 +344,9 @@ class OrderManager:
                 side="SELL",
             )
             gtt_results["stop_loss"] = sl_result
+            if not sl_result or sl_result.get("status") == "error":
+                logger.error(f"GTT_SL_FAILED: {symbol} SL=₹{stop_loss:.2f} result={sl_result}")
+                gtt_failed = True
 
         if take_profit > 0:
             tp_result = self.broker.place_gtt_order(
@@ -309,6 +357,57 @@ class OrderManager:
                 side="SELL",
             )
             gtt_results["take_profit"] = tp_result
+            if not tp_result or tp_result.get("status") == "error":
+                logger.error(f"GTT_TP_FAILED: {symbol} TP=₹{take_profit:.2f} result={tp_result}")
+                gtt_failed = True
+
+        if gtt_failed:
+            # In live mode: auto-close unprotected position for safety
+            # In paper mode: in-memory stops still work, just alert
+            from src.execution.paper_trader import PaperTrader
+            is_live_broker = not isinstance(self.broker, PaperTrader)
+            if is_live_broker:
+                if self._alert_fn:
+                    self._alert_fn(
+                        f"🚨 GTT FAILED: {symbol}\n"
+                        f"SL/TP not placed. Auto-closing position for safety."
+                    )
+                try:
+                    close_result = self.broker.place_order(
+                        symbol=symbol,
+                        instrument_key=instrument_key,
+                        quantity=quantity,
+                        side="SELL",
+                        order_type="MARKET",
+                        product="I",
+                    )
+                    logger.warning(
+                        f"GTT_AUTOCLOSE: {symbol} qty={quantity} "
+                        f"close_result={close_result.get('status')}"
+                    )
+                    return {
+                        "status": "error",
+                        "reason": "GTT failed, auto-closed position",
+                        "close_result": close_result,
+                    }
+                except Exception as e:
+                    logger.critical(
+                        f"GTT_AUTOCLOSE_FAILED: {symbol} — MANUAL INTERVENTION NEEDED: {e}"
+                    )
+                    if self._alert_fn:
+                        self._alert_fn(
+                            f"💀 CRITICAL: GTT failed AND auto-close failed for {symbol}\n"
+                            f"Error: {e}\n"
+                            f"MANUAL INTERVENTION REQUIRED"
+                        )
+            else:
+                # Paper mode: alert only, in-memory stops active
+                if self._alert_fn:
+                    self._alert_fn(
+                        f"🚨 GTT FAILED: {symbol}\n"
+                        f"SL/TP not placed at broker.\n"
+                        f"In-memory stops still active."
+                    )
 
         # ── Track order ──
         # ── Trailing stop params (from strategy signal) ──
@@ -316,6 +415,13 @@ class OrderManager:
         trail_exit_pct = features.get("trail_exit_pct", 0.12)
         trail_trigger_price = round(premium * (1 + trail_trigger_pct), 2)
         trail_exit_price = round(premium * (1 + trail_exit_pct), 2)
+
+        # Partial profit TP1 target
+        tp1_pct = features.get("tp1_pct", 0)
+        tp1_price = round(premium * (1 + tp1_pct), 2) if tp1_pct > 0 else 0
+
+        # Slippage tracking: signal_price = what strategy computed, fill_price = what broker filled
+        slippage = abs(fill_price - premium) / premium if premium > 0 else 0
 
         trade_record = {
             "trade_id": trade_id,
@@ -325,18 +431,26 @@ class OrderManager:
             "side": "BUY",
             "quantity": quantity,
             "lots": lots,
-            "price": premium,
+            "price": fill_price,  # Actual fill price (paper: premium+slippage, live: broker fill)
+            "signal_price": premium,
+            "fill_price": fill_price,
+            "fill_quantity": quantity,
+            "slippage_pct": round(slippage, 6),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "trail_trigger": trail_trigger_price,
             "trail_exit": trail_exit_price,
             "trail_activated": False,
+            "tp1_price": tp1_price,
+            "partial_exit_done": False,
             "strategy": signal.get("strategy", "options_buyer"),
             "regime": signal.get("regime", ""),
             "confidence": signal.get("confidence", 0),
             "timestamp": datetime.now().isoformat(),
+            "entry_time": datetime.now().isoformat(),
+            "status": "open",
             "gtt_orders": gtt_results,
-            "costs": self.risk_manager.calculate_options_trade_costs(premium, quantity, "BUY"),
+            "costs": self.risk_manager.calculate_options_trade_costs(fill_price, quantity, "BUY"),
             "is_options": True,
             "option_type": features.get("option_type", ""),
             "strike": features.get("strike", 0),
@@ -352,7 +466,7 @@ class OrderManager:
             f"| value=₹{quantity * premium:.0f} | trade_id={trade_id}"
         )
 
-        return {"status": "success", **trade_record}
+        return {**trade_record, "status": "success"}
 
     def _smart_order(
         self,
@@ -418,11 +532,12 @@ class OrderManager:
 
             try:
                 ltp_result = self.broker.get_ltp(instrument_key)
-                current_premium = ltp_result.get("ltp", 0)
+                current_premium = ltp_result.get("ltp", 0) if ltp_result else 0
             except Exception:
                 continue
 
-            if current_premium <= 0:
+            if current_premium is None or current_premium <= 0:
+                logger.warning(f"TRAIL_SKIP: invalid price {current_premium} for {trade.get('symbol', '')}")
                 continue
 
             trail_trigger = trade.get("trail_trigger", 0)
@@ -464,15 +579,114 @@ class OrderManager:
                     exits.append({
                         "trade_id": trade_id,
                         "symbol": trade["symbol"],
+                        "instrument_key": instrument_key,
                         "exit_reason": "trail_stop",
                         "entry_premium": trade["price"],
                         "exit_premium": current_premium,
+                        "quantity": trade["quantity"],
+                        "pnl": (current_premium - trade["price"]) * trade["quantity"],
                         "pnl_pct": (current_premium - trade["price"]) / trade["price"] * 100,
                         "exit_result": exit_result,
                     })
                     del self._pending_orders[trade_id]
                 except Exception as e:
                     logger.error(f"Failed trailing stop exit for {trade['symbol']}: {e}")
+
+        return exits
+
+    def check_tp1_exits(self, portfolio_positions: dict) -> list[dict[str, Any]]:
+        """
+        Check if any position has hit TP1 for partial profit exit.
+
+        Uses portfolio current_price (already updated by fast poll) — no extra LTP fetch.
+        Returns list of partial exit info dicts.
+        """
+        exits = []
+        for trade_id, trade in list(self._pending_orders.items()):
+            if not trade.get("is_options") or trade.get("partial_exit_done"):
+                continue
+
+            tp1_price = trade.get("tp1_price", 0)
+            if tp1_price <= 0:
+                continue
+
+            symbol = trade["symbol"]
+            pos = portfolio_positions.get(symbol)
+            if not pos or pos.partial_exit_done:
+                continue
+
+            current_premium = pos.current_price
+            if current_premium <= 0 or current_premium < tp1_price:
+                continue
+
+            exit_qty = pos.original_quantity // 2
+            if exit_qty <= 0:
+                continue
+
+            instrument_key = trade.get("instrument_key", "")
+            logger.info(
+                f"TP1_PARTIAL: {symbol} hit ₹{current_premium:.2f} >= TP1 ₹{tp1_price:.2f} "
+                f"| exiting {exit_qty}qty of {pos.original_quantity}"
+            )
+
+            # Place SELL for partial qty
+            try:
+                self.broker.place_order(
+                    symbol=symbol,
+                    instrument_key=instrument_key,
+                    quantity=exit_qty,
+                    side="SELL",
+                    order_type="MARKET",
+                    product="I",
+                )
+            except Exception as e:
+                logger.error(f"TP1 partial sell failed for {symbol}: {e}")
+                continue
+
+            # Cancel full-qty TP GTT
+            tp_gtt = trade.get("gtt_orders", {}).get("take_profit", {})
+            if tp_gtt.get("gtt_id"):
+                try:
+                    self.broker.cancel_gtt_order(tp_gtt["gtt_id"])
+                except Exception as e:
+                    logger.warning(f"Failed to cancel TP GTT: {e}")
+
+            # Cancel full-qty SL GTT, re-place at breakeven for remaining
+            sl_gtt = trade.get("gtt_orders", {}).get("stop_loss", {})
+            if sl_gtt.get("gtt_id"):
+                try:
+                    self.broker.cancel_gtt_order(sl_gtt["gtt_id"])
+                except Exception as e:
+                    logger.warning(f"Failed to cancel SL GTT: {e}")
+
+            remaining_qty = pos.quantity - exit_qty
+            if remaining_qty > 0:
+                new_sl = self.broker.place_gtt_order(
+                    instrument_key=instrument_key,
+                    trigger_price=trade["price"],  # Breakeven
+                    limit_price=round(trade["price"] * 0.95, 2),
+                    quantity=remaining_qty,
+                    side="SELL",
+                )
+                trade["gtt_orders"] = {"stop_loss": new_sl}
+            else:
+                trade["gtt_orders"] = {}
+
+            trade["partial_exit_done"] = True
+            trade["quantity"] = remaining_qty
+
+            exits.append({
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "exit_reason": "tp1_partial",
+                "entry_premium": trade["price"],
+                "exit_premium": current_premium,
+                "quantity": exit_qty,
+                "remaining_quantity": remaining_qty,
+                "pnl": (current_premium - trade["price"]) * exit_qty,
+                "pnl_pct": (current_premium - trade["price"]) / trade["price"] * 100,
+                "option_type": trade.get("option_type", ""),
+            })
 
         return exits
 
@@ -523,6 +737,16 @@ class OrderManager:
                         trade["status"] = status
                         del self._pending_orders[trade_id]
                         reconciled += 1
+
+                    elif status in ("open", "trigger_pending", "modified"):
+                        # Still active — keep in pending, no action needed
+                        pass
+
+                    elif status:
+                        logger.warning(
+                            f"OrderManager: Unknown order status '{status}' "
+                            f"for order {order_id}"
+                        )
 
         return {"reconciled": reconciled, "pending": len(self._pending_orders)}
 
@@ -637,7 +861,17 @@ class OrderManager:
             try:
                 ltp1 = self.broker.get_ltp(trade["leg1_instrument_key"]).get("ltp", 0)
                 ltp2 = self.broker.get_ltp(trade["leg2_instrument_key"]).get("ltp", 0)
-            except Exception:
+            except Exception as e:
+                spread_sym = trade.get("symbol", trade_id)
+                self._spread_ltp_errors[spread_sym] = self._spread_ltp_errors.get(spread_sym, 0) + 1
+                _err_count = self._spread_ltp_errors[spread_sym]
+                logger.error(f"SPREAD_LTP_ERROR: {spread_sym} (#{_err_count}) {e}")
+                if _err_count == 5 and self._alert_fn:
+                    self._alert_fn(
+                        f"⚠️ SPREAD MONITORING FAILED: {spread_sym}\n"
+                        f"5 consecutive LTP errors.\n"
+                        f"Position may be unmonitored."
+                    )
                 continue
             if ltp1 <= 0 or ltp2 <= 0:
                 continue
@@ -709,6 +943,180 @@ class OrderManager:
         if trade_id in self._pending_orders:
             del self._pending_orders[trade_id]
         logger.info(f"SPREAD EXIT: {trade['trade_type']} {reason} | id={trade_id}")
+
+    # ──────────────────────────────────────────
+    # PLUS Iron Condor Execution
+    # ──────────────────────────────────────────
+
+    def _execute_iron_condor_signal(
+        self,
+        signal: dict[str, Any],
+        capital: float,
+        current_positions: Any,
+    ) -> dict[str, Any]:
+        """Execute a 4-leg Iron Condor with cascading rollback on failure."""
+        features = signal.get("features", {})
+        qty = features.get("quantity", 0)
+
+        legs_placed: list[dict] = []
+
+        def _unwind_all():
+            for leg in legs_placed:
+                unwind_side = "SELL" if leg["side"] == "BUY" else "BUY"
+                self.broker.place_order(
+                    symbol=leg["symbol"],
+                    instrument_key=leg["instrument_key"],
+                    quantity=qty, side=unwind_side,
+                    order_type="MARKET", price=leg["price"], product="I",
+                )
+
+        leg_specs = [
+            ("sell_ce", "SELL", "CE"),
+            ("buy_ce", "BUY", "CE"),
+            ("sell_pe", "SELL", "PE"),
+            ("buy_pe", "BUY", "PE"),
+        ]
+
+        for prefix, side, opt_type in leg_specs:
+            strike = features[f"{prefix}_strike"]
+            premium = features[f"{prefix}_premium"]
+            inst_key = features.get(f"{prefix}_instrument_key", "")
+            sym = f"NIFTY{int(strike)}{opt_type}"
+
+            result = self.broker.place_order(
+                symbol=sym, instrument_key=inst_key,
+                quantity=qty, side=side,
+                order_type="MARKET", price=premium, product="I",
+            )
+            if result.get("status") != "success":
+                logger.critical(f"IC LEG FAILED: {prefix} — unwinding {len(legs_placed)} legs")
+                _unwind_all()
+                return {"status": "error", "reason": f"IC leg {prefix} failed, {len(legs_placed)} legs unwound"}
+
+            legs_placed.append({
+                "symbol": sym, "instrument_key": inst_key,
+                "side": side, "price": premium,
+                "order_id": result.get("order_id", ""),
+            })
+
+        # Track IC as a single unit
+        trade_id = str(uuid.uuid4())[:8]
+        trade_record = {
+            "trade_id": trade_id,
+            "is_iron_condor": True,
+            "is_spread": True,
+            "is_options": True,
+            "trade_type": "IRON_CONDOR",
+            "quantity": qty,
+            "sell_ce_instrument_key": features.get("sell_ce_instrument_key", ""),
+            "sell_ce_premium": features["sell_ce_premium"],
+            "sell_ce_strike": features["sell_ce_strike"],
+            "buy_ce_instrument_key": features.get("buy_ce_instrument_key", ""),
+            "buy_ce_premium": features["buy_ce_premium"],
+            "buy_ce_strike": features["buy_ce_strike"],
+            "sell_pe_instrument_key": features.get("sell_pe_instrument_key", ""),
+            "sell_pe_premium": features["sell_pe_premium"],
+            "sell_pe_strike": features["sell_pe_strike"],
+            "buy_pe_instrument_key": features.get("buy_pe_instrument_key", ""),
+            "buy_pe_premium": features["buy_pe_premium"],
+            "buy_pe_strike": features["buy_pe_strike"],
+            "net_credit": features.get("net_credit", 0),
+            "max_profit": features.get("max_profit", 0),
+            "max_loss": features.get("max_loss", 0),
+            "spread_width": features.get("spread_width", 0),
+            "regime": signal.get("regime", ""),
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._pending_orders[trade_id] = trade_record
+
+        logger.info(
+            f"IC EXECUTED: SELL {features['sell_ce_strike']}CE + BUY {features['buy_ce_strike']}CE | "
+            f"SELL {features['sell_pe_strike']}PE + BUY {features['buy_pe_strike']}PE | "
+            f"credit=₹{features.get('net_credit', 0):.0f} qty={qty} | id={trade_id}"
+        )
+        return {"status": "success", **trade_record}
+
+    def check_ic_exits(self) -> list[dict[str, Any]]:
+        """Monitor open Iron Condor positions for SL/TP exit conditions."""
+        exits = []
+        cfg = get_config()
+
+        for trade_id, trade in list(self._pending_orders.items()):
+            if not trade.get("is_iron_condor"):
+                continue
+
+            qty = trade.get("quantity", 0)
+            net_credit = trade.get("net_credit", 0)
+
+            try:
+                ltp_sell_ce = self.broker.get_ltp(trade["sell_ce_instrument_key"]).get("ltp", 0)
+                ltp_buy_ce = self.broker.get_ltp(trade["buy_ce_instrument_key"]).get("ltp", 0)
+                ltp_sell_pe = self.broker.get_ltp(trade["sell_pe_instrument_key"]).get("ltp", 0)
+                ltp_buy_pe = self.broker.get_ltp(trade["buy_pe_instrument_key"]).get("ltp", 0)
+            except Exception:
+                continue
+            if any(v <= 0 for v in [ltp_sell_ce, ltp_buy_ce, ltp_sell_pe, ltp_buy_pe]):
+                continue
+
+            # IC P&L = (credit - close_cost) * qty
+            close_cost_ce = ltp_sell_ce - ltp_buy_ce
+            close_cost_pe = ltp_sell_pe - ltp_buy_pe
+            total_close_cost = close_cost_ce + close_cost_pe
+            ic_pnl = (net_credit - total_close_cost) * qty
+
+            sl_threshold = -net_credit * cfg.IC_SL_MULTIPLIER * qty
+            tp_threshold = net_credit * (cfg.IC_TP_PCT / 100) * qty
+
+            should_exit = False
+            exit_reason = ""
+            if ic_pnl <= sl_threshold:
+                should_exit, exit_reason = True, "ic_sl"
+            elif ic_pnl >= tp_threshold:
+                should_exit, exit_reason = True, "ic_tp"
+
+            if should_exit:
+                ltp_dict = {
+                    trade["sell_ce_instrument_key"]: ltp_sell_ce,
+                    trade["buy_ce_instrument_key"]: ltp_buy_ce,
+                    trade["sell_pe_instrument_key"]: ltp_sell_pe,
+                    trade["buy_pe_instrument_key"]: ltp_buy_pe,
+                }
+                self._exit_iron_condor(trade_id, trade, exit_reason, ltp_dict)
+                exits.append({
+                    "trade_id": trade_id,
+                    "trade_type": "IRON_CONDOR",
+                    "exit_reason": exit_reason,
+                    "pnl": ic_pnl,
+                })
+
+        return exits
+
+    def _exit_iron_condor(
+        self, trade_id: str, trade: dict, reason: str, ltp_dict: dict,
+    ) -> None:
+        """Close all 4 legs of an IC position atomically."""
+        qty = trade.get("quantity", 0)
+        leg_specs = [
+            ("sell_ce", "BUY"),   # Buy back the sold CE
+            ("buy_ce", "SELL"),   # Sell the bought CE
+            ("sell_pe", "BUY"),   # Buy back the sold PE
+            ("buy_pe", "SELL"),   # Sell the bought PE
+        ]
+        for prefix, unwind_side in leg_specs:
+            inst_key = trade.get(f"{prefix}_instrument_key", "")
+            strike = trade.get(f"{prefix}_strike", 0)
+            opt_type = "CE" if "ce" in prefix else "PE"
+            sym = f"NIFTY{int(strike)}{opt_type}"
+            ltp = ltp_dict.get(inst_key, 0)
+            self.broker.place_order(
+                symbol=sym, instrument_key=inst_key,
+                quantity=qty, side=unwind_side,
+                order_type="MARKET", price=ltp, product="I",
+            )
+
+        if trade_id in self._pending_orders:
+            del self._pending_orders[trade_id]
+        logger.info(f"IC EXIT: IRON_CONDOR {reason} | id={trade_id}")
 
     @property
     def pending_count(self) -> int:

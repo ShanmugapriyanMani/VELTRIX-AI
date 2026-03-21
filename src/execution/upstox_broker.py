@@ -17,11 +17,40 @@ try:
     import upstox_client
     from upstox_client.rest import ApiException
     UPSTOX_AVAILABLE = True
+
+    # Monkey-patch ApiClient.__del__ to suppress "Bad file descriptor"
+    # error during Python shutdown (library prints to stdout on cleanup failure)
+    def _safe_api_client_del(self):
+        try:
+            if hasattr(self, "pool") and self.pool:
+                self.pool.close()
+        except Exception:
+            pass
+
+    upstox_client.ApiClient.__del__ = _safe_api_client_del
 except ImportError:
     UPSTOX_AVAILABLE = False
 
+from src.config.env_loader import get_config
 from src.execution.broker import BaseBroker
 from src.data.fetcher import build_auth_from_config
+
+
+def _inject_api_timeout(api_client, timeout_seconds: int) -> None:
+    """Wrap an Upstox ApiClient's REST request method to inject a default timeout.
+
+    The SDK passes _request_timeout=None by default, which means urllib3 waits
+    forever. This wrapper injects our configured timeout when none is specified.
+    """
+    rest = api_client.rest_client
+    original_request = rest.request
+
+    def _request_with_timeout(*args, **kwargs):
+        if kwargs.get("_request_timeout") is None:
+            kwargs["_request_timeout"] = timeout_seconds
+        return original_request(*args, **kwargs)
+
+    rest.request = _request_with_timeout
 
 
 class UpstoxBroker(BaseBroker):
@@ -48,6 +77,11 @@ class UpstoxBroker(BaseBroker):
         self._hft_api_client: Optional[upstox_client.ApiClient] = None
         self._order_api: Optional[Any] = None
         self._connected = False
+        self._data_fetcher: Optional[Any] = None
+
+    def set_data_fetcher(self, data_fetcher) -> None:
+        """Inject data_fetcher for WebSocket LTP cache access."""
+        self._data_fetcher = data_fetcher
 
     def connect(self) -> bool:
         """Connect and authenticate with Upstox."""
@@ -70,7 +104,13 @@ class UpstoxBroker(BaseBroker):
         hft_config = self.auth.get_hft_configuration()
         self._hft_api_client = upstox_client.ApiClient(hft_config)
 
+        # Inject default timeout on SDK REST clients (prevents indefinite hangs)
+        timeout_s = get_config().API_TIMEOUT_SECONDS
+        _inject_api_timeout(self._api_client, timeout_s)
+        _inject_api_timeout(self._hft_api_client, timeout_s)
+
         self._order_api = upstox_client.OrderApiV3(self._hft_api_client)
+        self._market_quote_api = upstox_client.MarketQuoteApi(self._api_client)
         self._connected = True
 
         logger.info("Upstox broker connected (LIVE)")
@@ -244,6 +284,64 @@ class UpstoxBroker(BaseBroker):
 
         return {}
 
+    def wait_for_fill(
+        self, order_id: str, timeout_seconds: int = 30, poll_interval: float = 2.0
+    ) -> dict[str, Any]:
+        """
+        Poll order status until filled, rejected, or timeout.
+
+        Returns:
+            {"filled": True/False, "avg_price": float, "filled_qty": int,
+             "order_id": str, "reason": str or None}
+        """
+        if not order_id:
+            return {"filled": False, "order_id": order_id, "reason": "no_order_id"}
+
+        elapsed = 0.0
+        while elapsed < timeout_seconds:
+            status = self.get_order_status(order_id)
+            order_status = (status.get("status") or "").lower()
+
+            if order_status == "complete":
+                avg_price = float(status.get("average_price", 0) or 0)
+                filled_qty = int(status.get("filled_quantity", 0) or 0)
+                logger.info(
+                    f"FILL_CONFIRMED: order={order_id} qty={filled_qty} "
+                    f"avg_price=₹{avg_price:.2f}"
+                )
+                return {
+                    "filled": True,
+                    "avg_price": avg_price,
+                    "filled_qty": filled_qty,
+                    "order_id": order_id,
+                    "reason": None,
+                }
+
+            if order_status in ("rejected", "cancelled"):
+                reason = status.get("reject_reason") or order_status
+                logger.warning(f"ORDER_REJECTED: {order_id} reason={reason}")
+                return {
+                    "filled": False,
+                    "avg_price": 0,
+                    "filled_qty": 0,
+                    "order_id": order_id,
+                    "reason": reason,
+                }
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        # Timeout — attempt cancel
+        logger.warning(f"ORDER_TIMEOUT: {order_id} not filled in {timeout_seconds}s")
+        self.cancel_order(order_id)
+        return {
+            "filled": False,
+            "avg_price": 0,
+            "filled_qty": 0,
+            "order_id": order_id,
+            "reason": "timeout",
+        }
+
     def get_positions(self) -> list[dict[str, Any]]:
         """Get all current positions."""
         if not self._connected or self._api_client is None:
@@ -335,8 +433,15 @@ class UpstoxBroker(BaseBroker):
         try:
             user_api = upstox_client.UserApi(self._api_client)
             response = user_api.get_user_fund_margin(api_version="2.0")
-            if response.data and hasattr(response.data, "equity"):
-                eq = response.data.equity
+            data = response.data
+            # SDK returns data as dict(str, UserFundMarginData)
+            if isinstance(data, dict):
+                eq = data.get("equity")
+            elif hasattr(data, "equity"):
+                eq = data.equity
+            else:
+                eq = None
+            if eq is not None:
                 available = getattr(eq, "available_margin", 0) or 0
                 used = getattr(eq, "used_margin", 0) or 0
                 payin = getattr(eq, "payin_amount", 0) or 0
@@ -355,6 +460,19 @@ class UpstoxBroker(BaseBroker):
                     "total_balance": available + used,
                 }
         except Exception as e:
+            # Extract clean Upstox error message if available
+            body = getattr(e, "body", None)
+            if body:
+                import json
+                try:
+                    err_data = json.loads(body) if isinstance(body, (str, bytes)) else body
+                    errors = err_data.get("errors", [])
+                    if errors:
+                        msg = errors[0].get("message", str(e))
+                        logger.error(f"Get funds failed: {msg}")
+                        return {}
+                except (json.JSONDecodeError, AttributeError, IndexError):
+                    pass
             logger.error(f"Get funds failed: {e}")
 
         return {}
@@ -410,7 +528,7 @@ class UpstoxBroker(BaseBroker):
             gtt_request = upstox_client.PlaceGTTOrderRequest(
                 type="SINGLE",
                 quantity=quantity,
-                product="D",
+                product="I",  # Options are intraday (MIS), not delivery
                 instrument_token=instrument_key,
                 transaction_type=side,
                 price=order_price,
@@ -436,14 +554,22 @@ class UpstoxBroker(BaseBroker):
             return {"status": "error", "message": str(e)}
 
     def get_ltp(self, instrument_key: str) -> dict[str, Any]:
-        """Fetch last traded price for an instrument."""
+        """Fetch last traded price — WebSocket cache first, REST fallback."""
+        # Try WebSocket cache (sub-millisecond, no API call)
+        if self._data_fetcher:
+            ws_ltp = self._data_fetcher.get_ws_ltp(instrument_key)
+            if ws_ltp and ws_ltp > 0:
+                return {"ltp": ws_ltp, "status": "success", "source": "ws"}
+
         if not self._connected:
             return {"ltp": 0}
 
         try:
-            configuration = self.auth.get_configuration()
-            api_client = upstox_client.ApiClient(configuration)
-            market_api = upstox_client.MarketQuoteApi(api_client)
+            market_api = getattr(self, "_market_quote_api", None)
+            if market_api is None:
+                configuration = self.auth.get_configuration()
+                api_client = upstox_client.ApiClient(configuration)
+                market_api = upstox_client.MarketQuoteApi(api_client)
             response = market_api.ltp(instrument_key=instrument_key)
 
             if response.data:
@@ -476,6 +602,60 @@ class UpstoxBroker(BaseBroker):
         except Exception as e:
             logger.error(f"GTT cancel failed: {e}")
             return {"status": "error", "message": str(e)}
+
+    def get_daily_pnl(self) -> Optional[float]:
+        """
+        Get today's realized P&L from Upstox positions.
+
+        Sums the `pnl` field from all positions (includes realized + unrealized).
+        Returns None on API failure (caller should skip reconciliation).
+        """
+        if not self._connected or self._api_client is None:
+            logger.warning("BROKER_PNL_FETCH_FAILED: not connected")
+            return None
+
+        try:
+            positions = self.get_positions()
+            if not positions:
+                return 0.0
+            total_pnl = sum(float(p.get("pnl", 0) or 0) for p in positions)
+            return round(total_pnl, 2)
+        except Exception as e:
+            logger.error(f"BROKER_PNL_FETCH_FAILED: {e}")
+            return None
+
+    def get_todays_trades(self) -> list[dict[str, Any]]:
+        """Get today's filled trades from Upstox trade book."""
+        if not self._connected or self._api_client is None:
+            return []
+
+        try:
+            order_api = upstox_client.OrderApi(self._api_client)
+            response = order_api.get_trade_book(api_version="2.0")
+            if response.data:
+                return [
+                    {
+                        "symbol": t.trading_symbol,
+                        "instrument_key": t.instrument_token,
+                        "quantity": t.quantity,
+                        "average_price": t.average_price,
+                        "trade_type": t.transaction_type,
+                        "order_id": t.order_id,
+                    }
+                    for t in response.data
+                ]
+        except Exception as e:
+            logger.error(f"Get trades for day failed: {e}")
+
+        return []
+
+    def get_available_margin(self) -> Optional[float]:
+        """Get available equity margin. Returns None on API failure."""
+        funds = self.get_funds()
+        if not funds:
+            return None
+        margin = funds.get("available_margin")
+        return float(margin) if margin is not None else None
 
     def square_off_all(self) -> dict[str, Any]:
         """Square off all open positions."""

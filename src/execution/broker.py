@@ -104,3 +104,8 @@ class BaseBroker(ABC):
     def square_off_all(self) -> dict[str, Any]:
         """Square off (close) all open positions."""
         ...
+
+    @abstractmethod
+    def get_ltp(self, instrument_key: str) -> dict[str, Any]:
+        """Get last traded price for an instrument. Returns {ltp: float}."""
+        ...

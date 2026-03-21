@@ -48,6 +48,14 @@ class PaperTrader(BaseBroker):
             f"{slippage_pct}% slippage"
         )
 
+    def reset_daily(self) -> None:
+        """Reset daily state for a new trading day."""
+        self._orders = {}
+        self._positions = {}
+        self._gtt_orders = {}
+        self._order_counter = 0
+        logger.info("PAPER_TRADER_RESET: daily state cleared")
+
     def connect(self) -> bool:
         logger.info("Paper Trader connected (simulated)")
         return True
@@ -67,6 +75,15 @@ class PaperTrader(BaseBroker):
         """Simulate order placement with instant fill for MARKET orders."""
         self._order_counter += 1
         order_id = f"PAPER-{self._order_counter:06d}"
+
+        # Guard: block SELL at price=0 (corrupts P&L)
+        if side == "SELL" and (price is None or price <= 0):
+            logger.error(f"PAPER_SELL_BLOCKED: {symbol} invalid exit_price={price}")
+            return {
+                "order_id": order_id,
+                "status": "rejected",
+                "message": f"SELL blocked: invalid price {price}",
+            }
 
         # Apply slippage
         if order_type == "MARKET":
@@ -251,8 +268,13 @@ class PaperTrader(BaseBroker):
         return {"status": "success"}
 
     def get_ltp(self, instrument_key: str) -> dict[str, Any]:
-        """Fetch last traded price via data_fetcher live quote."""
+        """Fetch last traded price — WebSocket cache first, REST fallback."""
         if self._data_fetcher is not None:
+            # Try WebSocket cache first (sub-millisecond, no API call)
+            ws_ltp = self._data_fetcher.get_ws_ltp(instrument_key)
+            if ws_ltp and ws_ltp > 0:
+                return {"ltp": ws_ltp, "status": "success", "source": "ws"}
+            # REST fallback
             try:
                 quote = self._data_fetcher.get_live_quote(instrument_key)
                 if quote and quote.get("ltp", 0) > 0:
@@ -260,29 +282,6 @@ class PaperTrader(BaseBroker):
             except Exception as e:
                 logger.warning(f"Paper get_ltp failed for {instrument_key}: {e}")
         return {"ltp": 0}
-
-    def place_spread_order(
-        self,
-        leg1_symbol: str, leg1_key: str, leg1_qty: int, leg1_side: str, leg1_price: float,
-        leg2_symbol: str, leg2_key: str, leg2_qty: int, leg2_side: str, leg2_price: float,
-    ) -> dict[str, Any]:
-        """Atomic two-leg spread order with rollback on failure."""
-        result1 = self.place_order(leg1_symbol, leg1_key, leg1_qty, leg1_side, price=leg1_price)
-        if result1.get("status") != "success":
-            return {"status": "error", "reason": "Leg 1 failed", "detail": result1}
-
-        result2 = self.place_order(leg2_symbol, leg2_key, leg2_qty, leg2_side, price=leg2_price)
-        if result2.get("status") != "success":
-            # Rollback leg 1
-            rollback_side = "SELL" if leg1_side == "BUY" else "BUY"
-            self.place_order(leg1_symbol, leg1_key, leg1_qty, rollback_side, price=leg1_price)
-            return {"status": "error", "reason": "Leg 2 failed, rolled back leg 1"}
-
-        return {
-            "status": "success",
-            "leg1_order_id": result1["order_id"],
-            "leg2_order_id": result2["order_id"],
-        }
 
     def square_off_all(self) -> dict[str, Any]:
         squared = 0
@@ -346,3 +345,128 @@ class PaperTrader(BaseBroker):
                     break
 
         return triggered
+
+    def place_iron_condor_order(
+        self,
+        signal: dict,
+        position_id: str,
+    ) -> dict:
+        """Simulate placing a 4-leg Iron Condor order with slippage."""
+        qty = signal.get("quantity", 0)
+        if qty <= 0:
+            return {"status": "rejected", "reason": "Zero quantity"}
+
+        # Leg 1: SELL CE (near OTM)
+        leg1 = self.place_order(
+            symbol=f"NIFTY{int(signal['sell_ce_strike'])}CE",
+            instrument_key=signal.get("sell_ce_instrument_key", ""),
+            quantity=qty, side="SELL",
+            price=signal["sell_ce_premium"], product="I",
+        )
+        # Leg 2: BUY CE (protection)
+        leg2 = self.place_order(
+            symbol=f"NIFTY{int(signal['buy_ce_strike'])}CE",
+            instrument_key=signal.get("buy_ce_instrument_key", ""),
+            quantity=qty, side="BUY",
+            price=signal["buy_ce_premium"], product="I",
+        )
+        # Leg 3: SELL PE (near OTM)
+        leg3 = self.place_order(
+            symbol=f"NIFTY{int(signal['sell_pe_strike'])}PE",
+            instrument_key=signal.get("sell_pe_instrument_key", ""),
+            quantity=qty, side="SELL",
+            price=signal["sell_pe_premium"], product="I",
+        )
+        # Leg 4: BUY PE (protection)
+        leg4 = self.place_order(
+            symbol=f"NIFTY{int(signal['buy_pe_strike'])}PE",
+            instrument_key=signal.get("buy_pe_instrument_key", ""),
+            quantity=qty, side="BUY",
+            price=signal["buy_pe_premium"], product="I",
+        )
+
+        all_ok = all(r.get("status") == "success" for r in [leg1, leg2, leg3, leg4])
+        if not all_ok:
+            logger.critical(f"IC LEG FAILURE -- manual review needed: {position_id}")
+            return {"status": "error", "reason": "Not all legs filled"}
+
+        # Compute actual credit after slippage
+        actual_credit = (
+            (signal["sell_ce_premium"] * (1 - self.slippage_pct))
+            + (signal["sell_pe_premium"] * (1 - self.slippage_pct))
+            - (signal["buy_ce_premium"] * (1 + self.slippage_pct))
+            - (signal["buy_pe_premium"] * (1 + self.slippage_pct))
+        )
+
+        logger.info(
+            f"IC_LEG: SELL {qty//65}L NIFTY{int(signal['sell_ce_strike'])}CE "
+            f"@ ₹{signal['sell_ce_premium']:.0f} (credit)"
+        )
+        logger.info(
+            f"IC_LEG: BUY  {qty//65}L NIFTY{int(signal['buy_ce_strike'])}CE "
+            f"@ ₹{signal['buy_ce_premium']:.0f} (debit)"
+        )
+        logger.info(
+            f"IC_LEG: SELL {qty//65}L NIFTY{int(signal['sell_pe_strike'])}PE "
+            f"@ ₹{signal['sell_pe_premium']:.0f} (credit)"
+        )
+        logger.info(
+            f"IC_LEG: BUY  {qty//65}L NIFTY{int(signal['buy_pe_strike'])}PE "
+            f"@ ₹{signal['buy_pe_premium']:.0f} (debit)"
+        )
+        logger.info(
+            f"IC_ENTRY: NIFTY Iron Condor | "
+            f"Range: {int(signal['sell_pe_strike'])}-{int(signal['sell_ce_strike'])} | "
+            f"Net credit: ₹{actual_credit:.0f}/unit | "
+            f"Max profit: ₹{signal.get('max_profit', 0):.0f} | "
+            f"Max loss: ₹{signal.get('max_loss', 0):.0f}"
+        )
+
+        return {
+            "status": "success",
+            "position_id": position_id,
+            "actual_credit": actual_credit,
+            "legs": [leg1, leg2, leg3, leg4],
+        }
+
+    def close_iron_condor_order(
+        self,
+        ic_position,
+        exit_reason: str,
+        ltp_dict: dict,
+    ) -> dict:
+        """Close all 4 legs of an IC position at current LTPs."""
+        qty = ic_position.quantity
+
+        # Buy back sell legs, sell protection legs
+        self.place_order(
+            symbol=f"NIFTY{int(ic_position.sell_ce_strike)}CE",
+            instrument_key=ic_position.sell_ce_instrument_key,
+            quantity=qty, side="BUY",
+            price=ltp_dict.get(ic_position.sell_ce_instrument_key, 0),
+            product="I",
+        )
+        self.place_order(
+            symbol=f"NIFTY{int(ic_position.buy_ce_strike)}CE",
+            instrument_key=ic_position.buy_ce_instrument_key,
+            quantity=qty, side="SELL",
+            price=ltp_dict.get(ic_position.buy_ce_instrument_key, 0),
+            product="I",
+        )
+        self.place_order(
+            symbol=f"NIFTY{int(ic_position.sell_pe_strike)}PE",
+            instrument_key=ic_position.sell_pe_instrument_key,
+            quantity=qty, side="BUY",
+            price=ltp_dict.get(ic_position.sell_pe_instrument_key, 0),
+            product="I",
+        )
+        self.place_order(
+            symbol=f"NIFTY{int(ic_position.buy_pe_strike)}PE",
+            instrument_key=ic_position.buy_pe_instrument_key,
+            quantity=qty, side="SELL",
+            price=ltp_dict.get(ic_position.buy_pe_instrument_key, 0),
+            product="I",
+        )
+
+        logger.info(f"IC_EXIT: {ic_position.position_id} | reason={exit_reason}")
+        return {"status": "success", "exit_reason": exit_reason}

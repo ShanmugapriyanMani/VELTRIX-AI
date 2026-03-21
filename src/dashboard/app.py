@@ -27,6 +27,7 @@ except ImportError:
     STREAMLIT_AVAILABLE = False
 
 from src.data.store import DataStore
+from src.config.env_loader import EnvConfig
 
 
 def main():
@@ -69,6 +70,8 @@ def main():
 
     # Load data
     store = DataStore()
+    config = EnvConfig()
+    initial_capital = config.TRADING_CAPITAL
 
     # Sidebar
     st.sidebar.header("Controls")
@@ -93,9 +96,9 @@ def main():
 
         if not portfolio.empty:
             latest = portfolio.iloc[-1]
-            total_value = latest.get("total_value", 500000)
+            total_value = latest.get("total_value", initial_capital)
             day_pnl = latest.get("day_pnl", 0)
-            total_pnl = total_value - 500000
+            total_pnl = total_value - initial_capital
             drawdown = latest.get("drawdown_pct", 0)
 
             col1.metric("Portfolio Value", f"₹{total_value:,.0f}", f"₹{total_pnl:+,.0f}")
@@ -105,7 +108,7 @@ def main():
             col4.metric("Drawdown", f"{drawdown:.1f}%",
                         delta_color="inverse")
         else:
-            col1.metric("Portfolio Value", "₹5,00,000")
+            col1.metric("Portfolio Value", f"₹{initial_capital:,.0f}")
             col2.metric("Day P&L", "₹0")
             col3.metric("Positions", "0")
             col4.metric("Drawdown", "0%")

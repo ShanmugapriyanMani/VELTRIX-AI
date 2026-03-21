@@ -202,34 +202,26 @@ def is_expiry_day(target_date: Optional[date] = None) -> bool:
     """
     Check if a date is a NIFTY weekly expiry day.
 
-    Normal expiry = Tuesday.
-    If Tuesday is a holiday, expiry shifts to the previous trading day.
-    e.g., Holi on Tue Mar 3 → expiry shifts to Mon Mar 2.
+    Uses get_expiry_type() to handle both old (Thursday) and new (Tuesday)
+    schedules automatically. Also handles holiday-shifted expiries.
     """
     target_date = target_date or date.today()
 
-    # If it IS Tuesday and it's a trading day → expiry
-    if target_date.weekday() == 1:
+    # Direct check: is this date a NIFTY expiry weekday and a trading day?
+    if get_expiry_type(target_date) != "NORMAL":
         is_open, _ = is_trading_day(target_date)
         return is_open
 
-    # If it's NOT Tuesday, check if this week's Tuesday is a holiday
-    # and this date is the previous trading day before that Tuesday
-    days_to_tuesday = (1 - target_date.weekday()) % 7
-    if days_to_tuesday == 0:
-        days_to_tuesday = 7  # Already past Tuesday, look at next week
-    this_tuesday = target_date + timedelta(days=days_to_tuesday)
-
-    # Only relevant if Tuesday is within the same week (Mon before Tue)
-    if days_to_tuesday > 1:
-        return False  # Wed/Thu/Fri — not close enough to be a shifted expiry
-
-    # Tuesday is tomorrow (we're on Monday)
-    is_tue_open, _ = is_trading_day(this_tuesday)
-    if not is_tue_open:
-        # Tuesday is a holiday — check if today is the previous trading day
-        prev_td = _prev_trading_day(this_tuesday)
-        return target_date == prev_td
+    # Holiday shift: find the next NIFTY expiry weekday within 1 day
+    # (e.g., Monday before a Tuesday holiday, or Wednesday before a Thursday holiday)
+    for offset in range(1, 2):
+        candidate = target_date + timedelta(days=offset)
+        if get_expiry_type(candidate) != "NORMAL":
+            is_open, _ = is_trading_day(candidate)
+            if not is_open:
+                # Expiry day is a holiday — check if today is the previous trading day
+                prev_td = _prev_trading_day(candidate)
+                return target_date == prev_td
 
     return False
 
@@ -261,6 +253,55 @@ def is_monthly_expiry(target_date: Optional[date] = None) -> bool:
         tue = target_date + timedelta(days=days_to_tuesday)
     next_week = tue + timedelta(days=7)
     return next_week.month != tue.month
+
+
+# ── Schedule cutoff dates for expiry type detection ──
+# Sep 1, 2025: NSE changed to single weekly expiry (Tuesday = NIFTY only)
+_NEW_SCHEDULE_DATE = date(2025, 9, 1)
+# Sep 4, 2023: Bank Nifty moved from Thursday to Wednesday
+_BANKNIFTY_WED_DATE = date(2023, 9, 4)
+
+
+def get_expiry_type(target_date: Optional[date] = None) -> str:
+    """Return the expiry type for a given date.
+
+    Returns one of: NIFTY_EXPIRY, BANKNIFTY_EXPIRY, SENSEX_EXPIRY, NORMAL.
+
+    Handles both old schedule (pre-2025-09-01) and new schedule.
+    Holiday-shifted expiry days are also detected correctly.
+
+    OLD SCHEDULE (date < 2025-09-01):
+      Thursday  → NIFTY_EXPIRY
+      Wednesday → BANKNIFTY_EXPIRY (only if date >= 2023-09-04, else NORMAL)
+      Friday    → SENSEX_EXPIRY
+      Others    → NORMAL
+
+    NEW SCHEDULE (date >= 2025-09-01):
+      Tuesday   → NIFTY_EXPIRY (only weekly expiry on NSE)
+      Thursday  → SENSEX_EXPIRY (BSE weekly)
+      Others    → NORMAL
+    """
+    target_date = target_date or date.today()
+    weekday = target_date.weekday()  # 0=Mon ... 6=Sun
+
+    if target_date >= _NEW_SCHEDULE_DATE:
+        # ── New schedule ──
+        if weekday == 1:  # Tuesday
+            return "NIFTY_EXPIRY"
+        if weekday == 3:  # Thursday
+            return "SENSEX_EXPIRY"
+        return "NORMAL"
+    else:
+        # ── Old schedule ──
+        if weekday == 3:  # Thursday
+            return "NIFTY_EXPIRY"
+        if weekday == 2:  # Wednesday
+            if target_date >= _BANKNIFTY_WED_DATE:
+                return "BANKNIFTY_EXPIRY"
+            return "NORMAL"
+        if weekday == 4:  # Friday
+            return "SENSEX_EXPIRY"
+        return "NORMAL"
 
 
 def next_trading_day(after: Optional[date] = None) -> date:

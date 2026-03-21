@@ -56,6 +56,40 @@ class BacktestTrade:
     net_premium: float = 0.0
     max_profit: float = 0.0
     max_loss: float = 0.0
+    # ── Iron Condor leg3/leg4 fields ──
+    leg3_symbol: str = ""
+    leg3_side: str = ""
+    leg3_entry_price: float = 0.0
+    leg3_exit_price: float = 0.0
+    leg4_symbol: str = ""
+    leg4_side: str = ""
+    leg4_entry_price: float = 0.0
+    leg4_exit_price: float = 0.0
+    # ── Factor analysis fields (defaults preserve backward compatibility) ──
+    direction: str = ""
+    score_diff: float = 0.0
+    bull_score: float = 0.0
+    bear_score: float = 0.0
+    f1_bull: float = 0.0   # EMA Trend
+    f1_bear: float = 0.0
+    f2_bull: float = 0.0   # RSI/MACD Momentum
+    f2_bear: float = 0.0
+    f3_bull: float = 0.0   # Price Action
+    f3_bear: float = 0.0
+    f4_bull: float = 0.0   # Mean Reversion
+    f4_bear: float = 0.0
+    f5_bull: float = 0.0   # Bollinger
+    f5_bear: float = 0.0
+    f6_bull: float = 0.0   # VIX
+    f6_bear: float = 0.0
+    f7_bull: float = 0.0   # ML XGBoost
+    f7_bear: float = 0.0
+    f8_bull: float = 0.0   # OI/PCR (backtest=0)
+    f8_bear: float = 0.0
+    f9_bull: float = 0.0   # Volume
+    f9_bear: float = 0.0
+    f10_bull: float = 0.0  # Global Macro
+    f10_bear: float = 0.0
 
 
 class BacktestEngine:
